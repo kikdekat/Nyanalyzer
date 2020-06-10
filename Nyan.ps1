@@ -56,8 +56,14 @@ Write-Host "▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒�
 #########################################################################################################
 $thisVersion = "v1.0"
 
+# Check admin privilege
+$isRunAsAdministrator = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+
 # Default number of log samples
 if(-not($samples)) { $samples = 100 }
+
+# If user has insufficient logs, treat them all as risk
+$forceRisk = 10
 
 # Domain name to append to the username
 $domain = "@ferris.edu"
@@ -65,7 +71,10 @@ $domain = "@ferris.edu"
 # Enable LocalAD: fetch intomation from LocalAD, this would slow the scripts down signnificantly
 # Set to false to use AzureAD, this may not get the users' group and correct password reset time
 # Could user Get-MsolUser as an alternative
-$LocalADon = $true
+$LocalADOn = $true
+
+# Enable AuditLogs analyze
+$AuditLogOn = $false
 
 # Number of the most frequent access IP (within the same State) to deem as "safe" (baseIP)
 $safeIP = 2
@@ -79,14 +88,22 @@ $HopsLimit = 2
 # Include MFA logs from the risk logs
 $inMFA = $true
 
-# API token for IP service (ipinfo.io)
-#$TOKEN = "942750a99a76cf"
+# API token for IP service (ipinfo.io) # Free account has 50,000 queries/month
+#$IPTOKEN = ""
+# API token for proxy detection (ip2location.com) # Free account has 500 queries/month for PX2 package
+$VPNTOKEN = ""
 
 # File name settings
 $ReportFile = "Nyan-Analyzing-Results_" + (Get-Date).tostring("MM-dd-yyyy") + ".html"
 $MonitorFile = "Nyan-Monitoring-Users.csv"
 $CompFile = "Nyan-Compromised-Users.csv"
 $credsFile = ".\creds.xml"
+
+# IP Proxy table
+$ProxyTableFile = ".\ProxyTable.xml"
+if (Test-Path $ProxyTableFile -PathType Leaf) {
+    $ProxyTable = Import-Clixml $ProxyTableFile
+} else { $ProxyTable = @{} }
 
 # IP to country table
 $IPTableFile = ".\IPLocation.xml"
@@ -96,6 +113,7 @@ if (Test-Path $IPTableFile -PathType Leaf) {
 
 $v6Table = @{}
 $v6RegEx = "(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))"
+$emailRegEx = "[a-zA-Z0-9!#$%*+\-/?^_`.{|}~]+@([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,4}"
 
 $StartDate = (GET-DATE)
 
@@ -142,13 +160,39 @@ param(
     [string]$credsFile = ".\creds.xml"
     )
 
-    $AzureCheck = Get-Module -ListAvailable -Name AzureAdPreview
-    if (!$AzureCheck) {
-        Write-Host "AzureAD module does not exist. Trying to install.."
-        Install-Module -Name AzureADPreview -AllowClobber
-        Import-Module -Name AzureADPreview
-    }
+    ###############################################################
+    # This section requires Admin privilege
+        $AzureCheck = Get-Module -ListAvailable -Name AzureAdPreview
+        $EXOCheck = Get-Module -ListAvailable -Name ExchangeOnlineManagement
 
+        if (!$AzureCheck) {
+            Write-Host "AzureAD module does not exist. Trying to install.."
+            if($isRunAsAdministrator) {
+                Install-Module -Name AzureADPreview -AllowClobber
+                Import-Module -Name AzureADPreview
+            } else { Write-Host "Please run the scripts using Administrator privilege." -ForegroundColor Red }
+        } 
+        
+        if (!$EXOCheck) {
+            Write-Host "ExchangeOnlineManagement module does not exist. Trying to install.."
+            if($isRunAsAdministrator) {
+                Install-Module -Name ExchangeOnlineManagement
+                Import-Module -Name ExchangeOnlineManagement
+            } else { Write-Host "Please run the scripts using Administrator privilege." -ForegroundColor Red }
+        }
+        $basicAuth = (Get-ItemProperty HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client\).AllowBasic
+        Write-Host "Checking BasicAuth:" ($basicAuth -eq 1) `n
+        if($basicAuth -eq 0 -and $AuditLogOn) {
+            if($isRunAsAdministrator) {
+                Set-ExecutionPolicy RemoteSigned
+                #winrm set winrm/config/client/auth @{Basic="true"}
+                Set-ItemProperty -Path "HKLM:SOFTWARE\Policies\Microsoft\Windows\WinRM\Client" -Name "AllowBasic" -Value 1
+                winrm quickconfig -force
+            } else { Write-Host "Extended AuditLog is ON but BasicAuth for WimRM is not enabled. Please run as Administrator."`n -ForegroundColor Red; Break }
+        } 
+    ################################################################
+
+    
     try 
     { $var = Get-AzureADTenantDetail } 
     catch [Microsoft.Open.Azure.AD.CommonLibrary.AadNeedAuthenticationException] 
@@ -161,8 +205,13 @@ param(
                 $creds = Get-Credential
                 $creds | Export-Clixml -Path $credsFile
             }
+            Write-Host "Connecting to AzureAD"
             Connect-AzureAD -Credential $creds
-            #Connect-MsolService -Credential $creds
+            $hasEXO = Get-PSSession
+            if(!$hasEXO) { 
+                Write-Host "Connecting to EXO"
+                #Connect-ExchangeOnline -Credential $creds 
+            }
         } catch { 
             try { Connect-AzureAD }
             catch { Break }
@@ -203,7 +252,7 @@ param(
 
     # Country check for IPv6
     if ($table[$ip] -eq $null) { 
-        $api = curl "ipinfo.io/$($ip)?token=$TOKEN"
+        $api = curl "ipinfo.io/$($ip)?token=$IPTOKEN"
         #$json = ($api -replace '\n', '') | ConvertFrom-Json 
         $location = ConvertFrom-Json -InputObject $api
         $table[$ip] = @($location)
@@ -215,6 +264,27 @@ param(
     return $location
 }
 
+function getProxyType {
+param(
+    [Parameter(Mandatory)]
+    [hashtable]$table,
+    [Parameter(Mandatory)]
+    [string]$ip
+    )
+
+    if(!$VPNTOKEN) { $VPNTOKEN = "demo" }
+    # Country check for IPv6
+    if ($table[$ip] -eq $null) { 
+        $api = curl "http://api.ip2proxy.com/?ip=$($ip)&key=$($VPNTOKEN)&package=PX2"
+        $proxy = ConvertFrom-Json -InputObject $api
+        $table[$ip] = @($proxy)
+        Write-Debug "IP API called"
+    } else {
+        $proxy = $table[$ip]
+    }
+
+    return $proxy
+}
 
 # Set time-limit for user's sign-in logs since the last password reset date OR the last 90 days
 # Force mode (-f) force to get log in the last 90 days
@@ -341,7 +411,7 @@ param(
     #Write-Host ($emptyDevices.Count/$user.Logs.Count) "Zzzzz" -ForegroundColor Red
 
     # If a "bad protocol"/emptydevice is used most of the time and had enough samples, it's likely legit for legacy client
-    if(($user.Logs.Count -gt 10) -and 
+    if(($user.Logs.Count -gt $forceRisk) -and 
         ($emptyDevices.Count/$user.Logs.Count -ge 0.8) -and
         ($hopCount -lt $HopsLimit) ) {
             $emptyDevices | % { 
@@ -426,6 +496,7 @@ param(
         ($_.IpAddress -notmatch $whiteIP) -and 
         ($_.Location.State -notmatch $baseState)
     }
+
     #Write-Debug ($riskLogs | Out-String)
     Write-Debug ("Total logs: " + $user.Logs.Count)
     Write-Debug ("Risk logs: " + ($riskLogs | Measure-Object).Count | Out-String)
@@ -477,15 +548,17 @@ param(
     Write-Debug ($failedlogs | Measure-Object).Count
 
    
-    # Group (success) RiskLogs into group by IP, then select the first and oldest of each IP
+    # Group (success) RiskLogs into group by IP, then select the first and oldest log of each IP
     $RiskByIP = $user.RiskLogs | Group IpAddress
     $oldestRiskbyIP = @()
     $RiskByIP | % { $oldestRiskbyIP += ($_.Group | Sort CreatedDateTime -Descending | Select -First 1)} 
 
+
     #Write-Host $oldestRiskbyIP.Count
     #$oldestRiskbyIP | % { Write-Host $_.IpAddress $_.CreatedDateTime }
 
-    # Password-spray/bruteforce detection
+    # Password-spray/bruteforce/proxy detection
+    $proxyCount = 0;
     for($i=0; $i -le $oldestRiskbyIP.Count-1; $i++) {
         $current = $oldestRiskbyIP[$i].CreatedDateTime
         $next = $oldestRiskbyIP[$i+1].CreatedDateTime
@@ -503,18 +576,35 @@ param(
         Write-Debug ("Failed attempts " + ($prevFailed | Out-String))
         Write-DeBug (($prevFailed | Measure-Object).Count)
         
-        # Multiple failed attempts follow by a success sigin
+        # Multiple failed attempts follow by a successful sigin
         if((($prevFailed | Measure-Object).Count -gt $HopsLimit) -or
-             # If a user is not in active group, higher risk
+             # If a user is not in active groups, higher risk
              ((($prevFailed | Measure-Object).Count -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
             $user.Compromised = $true
             $user.CompReason = " # Password-spray/Brute-force"
             Break
         }
+
+        # If user has insufficient logs, treat them all as risk and run additional IP check
+        # Because of the budget constraint, this only run on users with fewer logs. 
+        if($user.RiskLogs.Count -le $forceRisk) {
+            $IPType = getProxyType $ProxyTable $oldestRiskbyIP[$i].IpAddress
+            $isProxy = ($IPType.isProxy -eq "YES" -and $IPType.proxyType -ne "VPN")
+            if($isProxy) { $proxyCount++ }
+            if(($proxyCount -gt $HopsLimit) -or
+                 # If a user is not in active groups, higher risk
+                 (($proxyCount -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
+                $user.Compromised = $true
+                $user.CompReason = " # Proxied Connections"
+                Break
+            }
+        }
+
     }
 
     return $user
 }
+
 
 # Out put brief report to the screen
 function Summary {
@@ -554,15 +644,17 @@ param(
     [Parameter()]
     [int]$samples = $null,
     [Parameter()]
-    [switch]$f
+    [switch]$f,
+    [Parameter()]
+    [string]$msg = "Nyan is running.."
     )
 
     $user = initUser $username
-    Write-Host "Init user.. " (Measure-Command {$user = getLocalAD $user })
-    Write-Host "Getting AzureAD logs.. " (Measure-Command {$user = getAzureLogs $user -samples $samples -f:$f })
-    Write-Host "Identifying risk logs.. " (Measure-Command {$user = getRiskLogs $user -samples $samples -f:$f })
-    Write-Host "Analyzing risk logs.." (Measure-Command {if(!$user.Compromised -and ($user.RiskLogs | Measure-Object).Count -gt 0) { $user = analyzeRisks $user -samples $samples -f:$f } })
-    #Write-Host "Analyzing risk logs.." (Measure-Command {if(($user.RiskLogs | Measure-Object).Count -gt 0) { $user = analyzeRisks $user -samples $samples -f:$f } })
+    Write-Progress -Activity $username -CurrentOperation ("Init user.. " + (Measure-Command {$user = getLocalAD $user }) )
+    Write-Progress -Activity $username -CurrentOperation ("Getting AzureAD logs.. " + (Measure-Command {$user = getAzureLogs $user -samples $samples -f:$f }) )
+    Write-Progress -Activity $username -CurrentOperation ("Identifying risk logs.. " + (Measure-Command {$user = getRiskLogs $user -samples $samples -f:$f }) )
+    Write-Progress -Activity $username -CurrentOperation ("Analyzing risk logs.." + (Measure-Command {if(!$user.Compromised -and ($user.RiskLogs | Measure-Object).Count -gt 0) { $user = analyzeRisks $user -samples $samples -f:$f } }) )
+    #Write-Progress -Activity $msg -CurrentOperation ("Analyzing risk logs.." + (Measure-Command {if(($user.RiskLogs | Measure-Object).Count -gt 0) { $user = analyzeRisks $user -samples $samples -f:$f } }) )
     Write-Host "## DONE ##"`n`n -ForegroundColor Yellow
     if($f) { $user.LastSet = ($user.LastSet).ToString() + " (Forcemode was ON, limit set to the last 90 days)" }
     
@@ -630,6 +722,7 @@ param(
     )
 
     $IPTable | Export-Clixml -Path $IPTableFile
+    $ProxyTable | Export-Clixml -Path $ProxyTableFile
     $user | Where { ($_.RiskLogs | Measure-Object).Count -gt 0 -and !$_.Compromised} | 
             Select Email, LocalGroup, LastSet, @{Name='Added Date'; Expression={(Get-Date).tostring("MM-dd-yyyy HH:mm")} } |
             Export-Csv -Append -Path $MonitorFile -NoTypeInformation
@@ -755,6 +848,18 @@ function sendReport {
 
 }
 
+# Extract (unique) emails from abitrary file format using RegEx
+function extractEmails {
+param(
+    [Parameter(Mandatory)]
+    [string]$content
+    )
+
+    $emails = (Select-String -Path $content  -Pattern $emailRegEx -AllMatches | % { $_.Matches } | % { $_.Value } | Select -Unique).Trim()
+    return $emails
+}
+
+
 
 function Main {
     Clear-Host
@@ -770,13 +875,15 @@ function Main {
 
     if($isDebug) { Write-Host "DEBUG MODE"`n -ForegroundColor Red }
     if($username) {
-        try {
+        #try {
         $users = @()
             if (Test-Path $username -PathType Leaf) {
                 $i = 0;
-                foreach($item in (Get-Content $username)) {
+                $totalItems = extractEmails $username
+                foreach($item in $totalItems) {
                     $i++
-                    Write-Progress -Activity "Analyzing.." -Status "Progress: $i/$((Get-Content $username).Count)" -PercentComplete (($i / (Get-Content $username).Count)  * 100)
+                    $Activity = "Nyan is running.."
+                    Write-Progress -Activity $item -Status "Progress: $i / $($totalItems.Count)" -PercentComplete (($i / $totalItems.Count)  * 100)
                     $users += (NyanLogs -username $item -samples $samples -f:$f)
                     #Write-Debug ($tmp | Out-String)
                 }
@@ -788,12 +895,15 @@ function Main {
             Summary $users
             exportReport $users
             sendReport
-             
-        } catch { 
-            $ErrorMessage = $_.Exception.Message
-            $FailedItem = $_.Exception.ItemName
-            Write-Host $ErrorMessage
-        }
+            if($hasEXO) {
+                Disconnect-ExchangeOnline -Confirm:$false
+            }
+        #} catch { 
+        #    $ErrorMessage = $_.Exception.Message
+        #    $FailedItem = $_.Exception.ItemName
+        #    Write-Host $ErrorMessage
+        #    Disconnect-ExchangeOnline -Confirm:$false
+        #}
     } else {
         Write-Host "Usage: ./nyanalyzer.ps1 <input file OR a single email> [number of log samples] [-f] [-debug]
         # The script accepts up to 4 parameters
@@ -815,11 +925,11 @@ function Main {
     
 }
 
-try {
+#try {
     $runtTime = (Measure-Command { Main })
     $runtTime | select @{n="Run time";e={$_.Minutes,"Minutes",$_.Seconds,"seconds",$_.Milliseconds,"ms" -join " "}}
-} catch { 
-    $ErrorMessage = $_.Exception.Message
-    $FailedItem = $_.Exception.ItemName
-    Write-Host $ErrorMessage
-}
+#} catch { 
+#    $ErrorMessage = $_.Exception.Message
+#    $FailedItem = $_.Exception.ItemName
+#    Write-Host $ErrorMessage
+#}
