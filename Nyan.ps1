@@ -86,12 +86,17 @@ $extend = $true
 $HopsLimit = 2
 
 # Include MFA logs from the risk logs
-$inMFA = $true
+$inMFA = $false
 
 # API token for IP service (ipinfo.io) # Free account has 50,000 queries/month
 #$IPTOKEN = ""
-# API token for proxy detection (ip2location.com) # Free account has 500 queries/month for PX2 package
-$VPNTOKEN = ""
+
+# Using an array of free API keys for rotation ;)
+# APi token for ip2proxy.com
+$VPNTOKEN1 = @("")
+# API token for proxy detection (proxycheck.io) # Free account has 1000 queries/day
+$VPNTOKEN = @("")
+$nToken = 0
 
 # File name settings
 $ReportFile = "Nyan-Analyzing-Results_" + (Get-Date).tostring("MM-dd-yyyy") + ".html"
@@ -120,7 +125,7 @@ $StartDate = (GET-DATE)
 # Define blacklist/whitelist
 #$BadProtocols = @("IMAP4","Authenticated SMTP","POP3")
 $WhiteApps = @("Exchange ActiveSync")
-$WhiteIP = "^161\.57\.([1-9]?\d|[12]\d\d)\.([1-9]?\d|[12]\d\d)$"
+$WhiteIP = "^161\.57\.([1-9]?\d|[12]\d\d)\.([1-9]?\d|[12]\d\d)$|^204\.38\.(2[4-9]|3[01])\.([1-9]?\d|[12]\d\d)$"
 $badErrorCode = @("50053","50126")
 
 # List of active groups
@@ -256,7 +261,7 @@ param(
         #$json = ($api -replace '\n', '') | ConvertFrom-Json 
         $location = ConvertFrom-Json -InputObject $api
         $table[$ip] = @($location)
-        Write-Debug "IP API called"
+        Write-Debug "IP API called (ipinfo.io)"
     } else {
         $location = $table[$ip]
     }
@@ -272,19 +277,68 @@ param(
     [string]$ip
     )
 
-    if(!$VPNTOKEN) { $VPNTOKEN = "demo" }
-    # Country check for IPv6
-    if ($table[$ip] -eq $null) { 
-        $api = curl "http://api.ip2proxy.com/?ip=$($ip)&key=$($VPNTOKEN)&package=PX2"
-        $proxy = ConvertFrom-Json -InputObject $api
-        $table[$ip] = @($proxy)
-        Write-Debug "IP API called"
-    } else {
-        $proxy = $table[$ip]
-    }
+    $credit = (curl "https://api.ip2proxy.com/?key=$($VPNTOKEN1)&check=true" | ConvertFrom-Json).response
+    Write-Debug "IP2Proxy Credit: $($credit)"
+    if($credit -gt 0) {
 
+        if(!$VPNTOKEN1) { $VPNTOKEN1 = "demo" }
+
+        if (($table[$ip] -eq $null) -or ($table[$ip].isProxy -eq $null) -and ($table[$ip].Proxy -eq "no")) { 
+            $api = curl "http://api.ip2proxy.com/?ip=$($ip)&key=$($VPNTOKEN1)&package=PX2"
+            $proxy = ConvertFrom-Json -InputObject $api
+            #$table[$ip] = @($proxy)
+            $table[$ip] = $proxy
+            Write-Debug "IP API called (ip2proxy.com)"
+        } else {
+            $proxy = $table[$ip]
+        }
+    } else { Write-Host "ip2proxy.com key limit reached, please update a new key." -ForegroundColor Red }
     return $proxy
 }
+
+# Analyze if IPs are VPNs/Proxies, known threats, etc from proxycheck.io
+function getProxyRisk {
+param(
+    [Parameter(Mandatory)]
+    [hashtable]$table,
+    [Parameter(Mandatory)]
+    [string]$ip
+    )
+
+    $ips = ""
+    $RiskCount = 0
+    $ip.Split(",") | % { if($table[$_] -eq $null) { $ips += "$($_)," } }
+    $ips = $ips.TrimEnd(",")
+
+    if($ips.Split(",")[0] -ne "") {
+        $api = curl -Method Post "http://proxycheck.io/v2/?key=$($VPNTOKEN)&days=60&vpn=1&asn=1&node=1&time=1&inf=1&risk=2&port=1&seen=1&tag=msg" -Body "ips=$($ips)"
+        $proxy = ConvertFrom-Json -InputObject $api
+        $ips.Split(",") | % {
+            $table[$_] = $proxy.$_
+        }
+        Write-Debug "IP API called (proxycheck.io)"
+    }
+
+    $ip.Split(",") | % { 
+        if($table[$_] -ne $null) {
+            # If not VPN = risk
+            if(($table[$_].isProxy -eq "YES" -and $table[$_].Proxytype -ne "VPN") -or 
+                ($table[$_].Proxy -eq "yes" -and $table[$_].type -ne "VPN")) {
+                    $RiskCount++
+            # VPN + known attack history = risk
+            # Change to comment to switch between riskscore and attack history base
+            #} elseif ($table[$_].'attack history') { $RiskCount++  }
+            } elseif ($table[$_].risk -gt 66) { $RiskCount++  }
+        }   
+    
+    }
+    Write-Debug ($table | % {($_.isProxy -eq "YES" -or $_.Proxy -eq "yes")} | Out-String)
+
+    return $RiskCount
+
+}
+
+
 
 # Set time-limit for user's sign-in logs since the last password reset date OR the last 90 days
 # Force mode (-f) force to get log in the last 90 days
@@ -524,82 +578,100 @@ param(
 
     $email = $user.email
 
+
+    # Proxy detection, more proxy than HopsThreshold is redflag
+    # Using proxycheck.io first
+    $user.RiskLogs | Select -Unique IpAddress | % { $ips += "$($_.IpAddress)," }
+    $proxyRisk = getProxyRisk $ProxyTable $ips
+    Write-Debug "Proxy Risk: $($proxyRisk)"
+    if(($proxyRisk -gt $HopsLimit) -or
+         # If a user is not in active groups, higher risk
+         (($proxyRisk -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
+        $user.Compromised = $true
+        $user.CompReason = " # Proxied Connections ($($proxyRisk)) #1"
+    }
+
+
     #Get user's password set date
     $lastset = timeFilter $user.LastSet -f:$f
 
-    # Get AzureAD failed signin logs
-    for($i = 0; $i -lt $badErrorCode.Count; $i++) { 
-        if($i -eq 0) { $codeFilter += "status/errorCode eq $($badErrorCode[$i])" }
-        else { $codeFilter += " or status/errorCode eq $($badErrorCode[$i])" }
-    }
-    # 2020-05-24T01:15:36.2936106Z
-    $latestRiskTime = $user.RiskLogs | Sort CreatedDateTime -Descending | Select -First 1 CreatedDateTime
-    if($latestRiskTime) { 
-        $timelimit = "(createdDateTime le $($latestRiskTime.CreatedDateTime)) and (createdDateTime ge $lastset)" 
-    } else { $timelimit = "(createdDateTime ge $lastset)" }
 
-    #$filter = "(userPrincipalName eq '$email') and ($codeFilter) and (createdDateTime ge 2020-05-24T01:15:36.2936106Z)"
-    $filter = "(userPrincipalName eq '$email') and ($codeFilter) and $timelimit"
-    if($f) { $samples = $samples * 2}
-    $failedLogs = Get-AzureADAuditSignInLogs -All:$true -Filter $filter -Top $samples
-    Write-Debug $filter
+    if(!$user.Compromised) {
+        # Get AzureAD failed signin logs
+        for($i = 0; $i -lt $badErrorCode.Count; $i++) { 
+            if($i -eq 0) { $codeFilter += "status/errorCode eq $($badErrorCode[$i])" }
+            else { $codeFilter += " or status/errorCode eq $($badErrorCode[$i])" }
+        }
+        # 2020-05-24T01:15:36.2936106Z
+        $latestRiskTime = $user.RiskLogs | Sort CreatedDateTime -Descending | Select -First 1 CreatedDateTime
+        if($latestRiskTime) { 
+            $timelimit = "(createdDateTime le $($latestRiskTime.CreatedDateTime)) and (createdDateTime ge $lastset)" 
+        } else { $timelimit = "(createdDateTime ge $lastset)" }
 
-    #Write-Host ($failedlogs | Out-String)
-    Write-Debug ($failedlogs | Measure-Object).Count
+        #$filter = "(userPrincipalName eq '$email') and ($codeFilter) and (createdDateTime ge 2020-05-24T01:15:36.2936106Z)"
+        $filter = "(userPrincipalName eq '$email') and ($codeFilter) and $timelimit"
+        if($f) { $samples = $samples * 2}
+        $failedLogs = Get-AzureADAuditSignInLogs -All:$true -Filter $filter -Top $samples
+        Write-Debug $filter
+
+        #Write-Host ($failedlogs | Out-String)
+        Write-Debug ($failedlogs | Measure-Object).Count
 
    
-    # Group (success) RiskLogs into group by IP, then select the first and oldest log of each IP
-    $RiskByIP = $user.RiskLogs | Group IpAddress
-    $oldestRiskbyIP = @()
-    $RiskByIP | % { $oldestRiskbyIP += ($_.Group | Sort CreatedDateTime -Descending | Select -First 1)} 
+        # Group (success) RiskLogs into group by IP, then select the first and oldest log of each IP
+        $RiskByIP = $user.RiskLogs | Group IpAddress
+        $oldestRiskbyIP = @()
+        $RiskByIP | % { $oldestRiskbyIP += ($_.Group | Sort CreatedDateTime -Descending | Select -First 1)} 
 
 
-    #Write-Host $oldestRiskbyIP.Count
-    #$oldestRiskbyIP | % { Write-Host $_.IpAddress $_.CreatedDateTime }
+        #Write-Host $oldestRiskbyIP.Count
+        #$oldestRiskbyIP | % { Write-Host $_.IpAddress $_.CreatedDateTime }
 
-    # Password-spray/bruteforce/proxy detection
-    $proxyCount = 0;
-    for($i=0; $i -le $oldestRiskbyIP.Count-1; $i++) {
-        $current = $oldestRiskbyIP[$i].CreatedDateTime
-        $next = $oldestRiskbyIP[$i+1].CreatedDateTime
-        if($i -eq $oldestRiskbyIP.Count-1) {
-            $next = $lastset
-        }
+        # Password-spray/bruteforce/proxy detection
+        $proxyCount = 0;
+        for($i=0; $i -le $oldestRiskbyIP.Count-1; $i++) {
+            $current = $oldestRiskbyIP[$i].CreatedDateTime
+            $next = $oldestRiskbyIP[$i+1].CreatedDateTime
+            if($i -eq $oldestRiskbyIP.Count-1) {
+                $next = $lastset
+            }
 
-        $prevFailed = ($failedLogs | Where {
-            ($_.CreatedDateTime -le $current -and $_.CreatedDateTime -gt $next) -and 
-            # + OR statement = more aggressive
-            (($_.Location.State -ne $user.BaseState.Name) )#-or ($user.BaseIP -notcontains $_.IpAddress));
-            } | Group IpAddress)
+            $prevFailed = ($failedLogs | Where {
+                ($_.CreatedDateTime -le $current -and $_.CreatedDateTime -gt $next) -and 
+                # + OR statement = more aggressive
+                (($_.Location.State -ne $user.BaseState.Name) )#-or ($user.BaseIP -notcontains $_.IpAddress));
+                } | Group IpAddress)
 
-        Write-Debug ($current + " -> " + $next)    
-        Write-Debug ("Failed attempts " + ($prevFailed | Out-String))
-        Write-DeBug (($prevFailed | Measure-Object).Count)
+            Write-Debug ($oldestRiskbyIP[$i].IpAddress + " # " + $current + " -> " + $next + " # " + $oldestRiskbyIP[$i+1].IpAddress)    
+            #Write-Debug ("Failed attempts " + ($prevFailed | Out-String))
+            Write-DeBug (($prevFailed | Measure-Object).Count)
         
-        # Multiple failed attempts follow by a successful sigin
-        if((($prevFailed | Measure-Object).Count -gt $HopsLimit) -or
-             # If a user is not in active groups, higher risk
-             ((($prevFailed | Measure-Object).Count -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
-            $user.Compromised = $true
-            $user.CompReason = " # Password-spray/Brute-force"
-            Break
-        }
-
-        # If user has insufficient logs, treat them all as risk and run additional IP check
-        # Because of the budget constraint, this only run on users with fewer logs. 
-        if($user.RiskLogs.Count -le $forceRisk) {
-            $IPType = getProxyType $ProxyTable $oldestRiskbyIP[$i].IpAddress
-            $isProxy = ($IPType.isProxy -eq "YES" -and $IPType.proxyType -ne "VPN")
-            if($isProxy) { $proxyCount++ }
-            if(($proxyCount -gt $HopsLimit) -or
+            # Multiple failed attempts follow by a successful sigin
+            if((($prevFailed | Measure-Object).Count -gt $HopsLimit) -or
                  # If a user is not in active groups, higher risk
-                 (($proxyCount -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
+                 ((($prevFailed | Measure-Object).Count -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
                 $user.Compromised = $true
-                $user.CompReason = " # Proxied Connections"
+                $user.CompReason = " # Password-spray/Brute-force"
                 Break
             }
-        }
 
+            # If user has insufficient logs, treat them all as risk and run additional IP check using ip2proxy.com
+            # Because of the budget constraint, this only run on users with fewer logs.
+            if($user.RiskLogs.Count -le $forceRisk -and !$user.Compromised -and ($oldestRiskbyIP[$i].Location.CountryOrRegion -ne $user.baseCountry.Name) ) {
+                $IPType = getProxyType $ProxyTable $oldestRiskbyIP[$i].IpAddress
+                Write-DeBug $IPType
+                $isProxy = (($IPType.isProxy -eq "YES" -and $IPType.proxyType -ne "VPN") -or ($IPType.Proxy -eq "yes" -and $IPType.Type -ne "VPN"))
+                if($isProxy) { $proxyCount++ }
+                if(($proxyCount -gt $HopsLimit) -or
+                     # If a user is not in active groups, higher risk
+                     (($proxyCount -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
+                    $user.Compromised = $true
+                    $user.CompReason = " # Proxied Connections ($($proxyCount)) #2"
+                    Break
+                }
+            }
+
+        }
     }
 
     return $user
@@ -776,11 +848,28 @@ param(
             $html += "<link rel='stylesheet' href='https://cdn.datatables.net/1.10.21/css/jquery.dataTables.min.css'>
                       <script src='https://cdn.datatables.net/1.10.21/js/jquery.dataTables.min.js'></script>"
             $html += $riskhead
-            $html += $_ | Select @{Name='Email';Expression={$_.Email};}, @{Name='Group';Expression={$_.LocalGroup};},@{Name='Last Set';Expression={($_.Lastset)};}, @{Name='VPN User';Expression={ if($_.VPN) { $vcolor = "#9c0000"}; "<div style='color: $($vcolor); font-weight: bold;'>$($_.VPN)</div>" };}, @{Name='Logs';Expression={$_.Logs.Count};}, @{Name='RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, @{Name='BaseIP';Expression={ $_.BaseIP | % { $str+="$_ <br>" } ; $str };}, @{Name='BaseDevices';Expression={$_.BaseDevices | % { $str+="$($_.Name) <br>" } ; $str };}, @{Name='BaseState';Expression={$_.BaseState.Name};}, @{Name='BaseCountry';Expression={$_.BaseCountry};} | ConvertTo-Html -Fragment -As List
+            $html += $_ | Select @{Name='Email';Expression={$_.Email};}, 
+                                 @{Name='Group';Expression={$_.LocalGroup};},
+                                 @{Name='Last Set';Expression={($_.Lastset)};}, 
+                                 @{Name='VPN User';Expression={ if($_.VPN) { $vcolor = "#9c0000"}; "<div style='color: $($vcolor); font-weight: bold;'>$($_.VPN)</div>" };}, 
+                                 @{Name='Logs';Expression={$_.Logs.Count};}, 
+                                 @{Name='RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, 
+                                 @{Name='BaseIP';Expression={ $_.BaseIP | % { $str+="$_ <br>" } ; $str };}, 
+                                 @{Name='BaseDevices';Expression={$_.BaseDevices | % { $str+="$($_.Name) <br>" } ; $str };}, 
+                                 @{Name='BaseState';Expression={$_.BaseState.Name};}, 
+                                 @{Name='BaseCountry';Expression={$_.BaseCountry};} | 
+                                 ConvertTo-Html -Fragment -As List
+
             $html2 += "<button class='btn btn-primary btn-sm btn-block mb-1 font-weight-bold' type='button' data-toggle='collapse' data-target='#$(($_.Email).Split('@')[0] )' aria-expanded='false' aria-controls='$(($_.Email).Split('@')[0] )'>View $($_.Email)'s Risky Logs</button><div id='$(($_.Email).Split('@')[0] )' class='collapse'>"
             #$html2 += $_.RiskLogs | ConvertTo-Html -Property CreatedDateTime, UserDisplayName, UserPrincipalName, AppDisplayName, IpAddress, ClientAppUsed, DeviceDetail, Location, IsInteractive, ResourceDisplayName, Status, TokenIssuerName, TokenIssuerType, ProcessingTimeInMilliseconds, RiskDetail, RiskLevelAggregated, RiskLevelDuringSignIn, RiskState, MfaDetail -Fragment
             #$html2 += ConvertTo-HTMLTable ($_.RiskLogs | Select CreatedDateTime, UserDisplayName, UserPrincipalName, AppDisplayName, IpAddress, ClientAppUsed, DeviceDetail, Location, IsInteractive, ResourceDisplayName, Status, TokenIssuerName, TokenIssuerType, ProcessingTimeInMilliseconds, RiskDetail, RiskLevelAggregated, RiskLevelDuringSignIn, RiskState, MfaDetail)
-            $html2 += ConvertTo-HTMLTable ($_.RiskLogs | Select CreatedDateTime, UserDisplayName, UserPrincipalName, AppDisplayName, IpAddress, ClientAppUsed, DeviceDetail, Location, IsInteractive, ResourceDisplayName, RiskDetail, RiskLevelAggregated, RiskLevelDuringSignIn, RiskState)
+            $html2 += ConvertTo-HTMLTable ($_.RiskLogs | Select CreatedDateTime, UserDisplayName, UserPrincipalName, AppDisplayName, `
+                        @{Name="IpAddress"; Expression={ 
+                                if($ProxyTable[$_.IpAddress].isProxy -eq "YES" -or $ProxyTable[$_.IpAddress].Proxy -eq "yes") 
+                                { $_.IpAddress = "<span class='text-danger font-weight-bold'>$($_.IpAddress) ($($ProxyTable[$_.IpAddress].ProxyType)$($ProxyTable[$_.IpAddress].Type))</span>" }
+                                $_.IpAddress } },
+                        ClientAppUsed, DeviceDetail, Location, IsInteractive, ResourceDisplayName, RiskDetail, RiskLevelAggregated, RiskLevelDuringSignIn, RiskState)
+
             $html2 += "</div>"
             $tablelist += "
                    `$('#$(($_.Email).Split('@')[0] )_table').DataTable({
@@ -792,7 +881,20 @@ param(
             $html += "<a class='btn-secondary' data-toggle='collapse' href='#$(($_.Email).Split('@')[0] )' role='button' aria-expanded='false' aria-controls='$(($_.Email).Split('@')[0] )'>
             <div class='button btn-secondary text-success py-1 px-1 font-weight-bold'>$($_.Email) $($done)</div></a>
             <div id='$(($_.Email).Split('@')[0] )' class='collapse'>"
-            $html += $_ | Select @{Name='Email';Expression={$_.Email};}, @{Name='Group';Expression={$_.LocalGroup};},@{Name='Last Set';Expression={($_.Lastset)};}, @{Name='VPN User';Expression={ if($_.VPN) { $vcolor = "#9c0000"}; "<div style='color: $($vcolor); font-weight: bold;'>$($_.VPN)</div>" };}, @{Name='Logs';Expression={$_.Logs.Count};}, @{Name='RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, @{Name='BaseIP';Expression={ $_.BaseIP | % { $str+="$_ <br>" } ; $str };}, @{Name='BaseDevices';Expression={$_.BaseDevices | % { $str+="$($_.Name) <br>" } ; $str };}, @{Name='BaseState';Expression={$_.BaseState.Name};}, @{Name='BaseCountry';Expression={$_.BaseCountry};} | ConvertTo-Html -Fragment -As List
+            $html += $_ | Select @{Name='Email';Expression={$_.Email};}, 
+                                 @{Name='Group';Expression={$_.LocalGroup};},
+                                 @{Name='Last Set';Expression={($_.Lastset)};}, 
+                                 @{Name='VPN User';
+                                    Expression={ 
+                                        if($_.VPN) { $vcolor = "#9c0000"}; "<div style='color: $($vcolor); font-weight: bold;'>$($_.VPN)</div>" };}, 
+                                 @{Name='Logs';Expression={$_.Logs.Count};},
+                                 @{Name='RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, 
+                                 @{Name='BaseIP';Expression={ $_.BaseIP | % { $str+="$_ <br>" } ; $str };}, 
+                                 @{Name='BaseDevices';Expression={$_.BaseDevices | % { $str+="$($_.Name) <br>" } ; $str };}, 
+                                 @{Name='BaseState';Expression={$_.BaseState.Name};}, 
+                                 @{Name='BaseCountry';Expression={$_.BaseCountry};} | 
+                                 ConvertTo-Html -Fragment -As List
+
             $html += "</div>"
         }
         $html += "</div>"
@@ -919,7 +1021,7 @@ function Main {
         Write-Debug ($users.baseCountry | Out-String)
         Write-Debug ($users.baseIP | Out-String)
         #Write-Debug ($user.Logs | Out-String)      
-        Write-Debug ($IPTable | Out-String)
+        #Write-Debug ($IPTable | Out-String)
 
     }
     
