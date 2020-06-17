@@ -1,5 +1,5 @@
 ﻿# Nyanalyzer - An AzureAD users' activities analyzer
-# Version: 1.0 @ 06/07/2020
+# Version: 1.0 @ 06/17/2020
 # Tri Bui @ Ferris State University
 #
 # Usage: ./nyanalyzer.ps1 <input file OR a single email> [number of log samples] [-f] [-debug]
@@ -1197,13 +1197,19 @@ param(
             if(($_.AuditLogs | Measure-Object).Count -gt 0) {
                 $html3 += "<div id='$(($_.Email).Split('@')[0] )_AuditLogs' class='collapse'>"
                 $html3 += ConvertTo-HTMLTable ($_.AuditLogs | Select CreationTime, UserId, Operation,
-                                                                      @{Name='Rules'; Expression={ "<div class='container'>"
-                                                                            $_.Parameters | % {
-                                                                                $warn = ""
-                                                                                if($RiskRules -contains $_.Name) { $warn = "text-danger font-weight-bold" }
-                                                                                "<div class='row table-striped border-bottom $warn'>" +`
-                                                                                "<div class='col-2 pl-1'>" + $_.Name + "</div>
-                                                                                 <div class='col text-right pr-1'>" + $_.Value + "</div>" + `
+                                                                      @{Name='Content'; Expression={ "<div class='container'>"
+                                                                            if($_.Parameters) {
+                                                                                $_.Parameters | % {
+                                                                                    $warn = ""
+                                                                                    if($RiskRules -contains $_.Name) { $warn = "text-danger font-weight-bold" }
+                                                                                    "<div class='row table-striped border-bottom $warn'>" +`
+                                                                                    "<div class='col-2 pl-1'>" + $_.Name + "</div>
+                                                                                     <div class='col text-right pr-1'>" + $_.Value + "</div>" + `
+                                                                                    "</div>"
+                                                                                }
+                                                                            } else {
+                                                                                "<div class='row px-0'>"
+                                                                                $_.ObjectId
                                                                                 "</div>"
                                                                             }
                                                                             "</div>"
