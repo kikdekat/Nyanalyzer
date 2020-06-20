@@ -3,11 +3,13 @@
 # Tri Bui @ Ferris State University
 #
 # Usage: ./nyanalyzer.ps1 <input file OR a single email> [number of log samples] [-f] [-debug]
-# The script accepts up to 4 parameters
+# The script accepts up to 6 parameters
 # The first one is required: could be a list of emails in file, or a single email or an inline list of users "user1, user2"
 # The second one is optional: define the number of log sample you want to analyze
 # -f: force the script to get logs from the last 90 days
 # -debug: debug mode
+# -killEXO switch: kill EXO connection without asking, reserved
+# -keep switch: keep EXO connection without asking, reserved
 
 param(
     [Parameter()]
@@ -16,8 +18,12 @@ param(
     [int]$samples = $null,
     [Parameter()]
     [switch]$f,
+    # -killEXO switch: kill EXO connection without asking, reserved
     [Parameter()]
-    [switch]$killEXO
+    [switch]$killEXO,
+    # -keep switch: keep EXO connection without asking, reserved
+    [Parameter()]
+    [switch]$keep
     )
 
 if ($PSBoundParameters['Debug']) {
@@ -96,7 +102,7 @@ $extend = $true
 # Country hop threshold - how many different countries from the logs to trigger the compromised flag
 $HopsLimit = 2
 
-# Include MFA logs from the risk logs
+# Include MFA logs in the risk logs
 $inMFA = $false
 
 # API token for IP service (ipinfo.io) # Free account has 50,000 queries/month
@@ -141,8 +147,9 @@ $badErrorCode = @("50053","50126")
 # If base Country is from the badCountries, they're risks.
 $badCountries = @("NG")
 
-# Whitelist Countries
+# Whitelist Localtion
 $whiteCountries = @("US")
+$whiteState = @("Michigan")
 
 # List of active groups
 $activeGroups = @("Users","Current")
@@ -406,7 +413,7 @@ param(
     } else { 
         $lastsetts = New-TimeSpan -End (GET-DATE) -Start $lastset
         if($lastsetts.Days -gt 90) { $lastset = (GET-DATE).AddDays(-90).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") }
-        else { $lastset = $lastset.AddHours(6).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") }
+        else { $lastset = $lastset.AddHours(0).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") }
     }
     return $lastset
 }
@@ -457,6 +464,7 @@ param(
 }
 
 
+
 # Dumping AzureAD success sign-in logs using preset filter
 function getAzureLogs {
 param(
@@ -476,7 +484,7 @@ param(
     
     # Get AzureAD logs
     $filter = "userPrincipalName eq '$email' and status/errorCode eq 0 and createdDateTime ge $lastset"
-    $logs = Get-AzureADAuditSignInLogs -Filter $filter -Top $samples
+    $logs = Get-AzureADAuditSignInLogs -Filter $filter -Top $samples -All:$true
     $user | Add-Member -MemberType NoteProperty -Name Logs -Value $logs
     $user.Logs | Where { $_ | Select -Exp Location | Where CountryOrRegion -eq $null } | % { 
         $ipLoc = getIPLocation $IPTable $_.IpAddress
@@ -484,7 +492,7 @@ param(
         $_.Location.State = $ipLoc.region
         $_.Location.CountryOrRegion = $ipLoc.country
     }
-
+    
     return $user
 }
 
@@ -506,14 +514,6 @@ param(
                                                                  ($_.Browser -eq $null) } 
                                         }
 
-    # Most obvious signs: 
-    # - Multiple countries = redflag
-    $hopCount = (($user.Logs.Location | Group-Object CountryOrRegion | Sort Count -Descending) | Measure-Object).Count
-    if($hopCount -gt $HopsLimit) {
-        $user.Compromised = $true
-        $user.CompReason = " # Countries Hopper (Multiple)"
-    }
-
     # If a "bad protocol"/emptydevice is used most of the time and had enough samples, it's likely legit for legacy client
     if(($user.Logs.Count -gt $forceRisk) -and 
         ($emptyDevices.Count/$user.Logs.Count -ge 0.8) -and
@@ -526,9 +526,12 @@ param(
             }
     }
 
+
     $baseDevices = @()
+    $baseUA = @()
     # Get trusted/registered devices
     $trustedDevices = ($user.Logs | Where { ($_.DeviceDetail.TrustType -ne $null) } | Select -Exp DeviceDetail -Unique)
+    $trustedUA = ($user.Logs | Where { ($_.DeviceDetail.TrustType -ne $null) } | Select userAgent -Unique)
 
     if($trustedDevices) {
 
@@ -553,10 +556,24 @@ param(
                                               ($_.DeviceDetail.OperatingSystem -ne $null) -or 
                                               ($_.DeviceDetail.Browser -ne $null) )
                                             } | Select -Exp DeviceDetail -Unique)
+
+            $baseUA += ($user.Logs | Where { 
+                                            #$inlog = $_
+                                            #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                            ($_.IpAddress -eq $tmp) -and 
+                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                              ($_.DeviceDetail.Browser -ne $null) )
+                                            } | Select userAgent -Unique)
                     }
 
+
+                                
         $baseDevices += $trustedDevices
         $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select -Unique)
+
+        $baseUA += $trustedUA
+        $baseUA = @($baseUA | Where { $_ -ne $null } | Select -Unique)
         
     } 
 
@@ -586,6 +603,15 @@ param(
                                               ($_.DeviceDetail.OperatingSystem -ne $null) -or 
                                               ($_.DeviceDetail.Browser -ne $null) )
                                             } | Select -Exp DeviceDetail -Unique)
+
+            $baseUA += ($user.Logs | Where { 
+                                            #$inlog = $_
+                                            #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                            ($_.IpAddress -eq $tmp) -and 
+                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                              ($_.DeviceDetail.Browser -ne $null) )
+                                            } | Select userAgent -Unique)
                     }
 
 
@@ -600,9 +626,18 @@ param(
                                                     ($_.DeviceDetail.OperatingSystem -ne $null) -or 
                                                     ($_.DeviceDetail.Browser -ne $null) )
                                             } | Select -Exp DeviceDetail -First $ref -Unique)
+
+            $baseUA += ($user.Logs | Where { #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                                  ($_.Location.State -eq $baseState.Name)  -and 
+                                                  ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                    ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                    ($_.DeviceDetail.Browser -ne $null) )
+                                            } | Select userAgent -First $ref -Unique)
+
         } 
 
         $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select -Unique)
+        $baseUA = @($baseUA | Where { $_ -ne $null } | Select -Unique)
         
         # Get trusted/registered devices
         #$baseDevices += ($user.Logs | Where { ($baseDevices -notcontains $_.DeviceDetail) -and 
@@ -630,7 +665,10 @@ param(
 
     # Identify risk logs
     if(($user.Logs | Measure-Object).Count -le $forceRisk) {
-        $riskLogs = $user.Logs
+        $riskLogs = $user.Logs | Where { 
+            (($_.MfaDetail -eq $null) -or $inMFA) -and 
+            ($whiteState -notcontains $_.Location.State)
+        }
     } else {
         $riskLogs = $user.Logs | Where { 
             #(($baseDevices -notcontains $_.DeviceDetail) -and ($_.MfaDetail -eq $null)) -or (($baseState.Name -ne ($_.Location.State) -and ($baseDevices -notcontains $_.DeviceDetail) -and ($_.MfaDetail -eq $null)) )
@@ -638,9 +676,18 @@ param(
             (($baseDevices -notcontains $_.DeviceDetail) -and ($baseIP.Name -notcontains $_.IpAddress) ) -and
             (($_.MfaDetail -eq $null) -or $inMFA) -and 
             ($_.IpAddress -notmatch $whiteIP) -and 
-            ($baseState.Name -notcontains $_.Location.State) -or
-            ($badCountries -contains $_.Location.CountryOrRegion)
+            (($baseState.Name -notcontains $_.Location.State) -or
+            ($whiteState -notcontains $_.Location.State) -or
+            ($badCountries -contains $_.Location.CountryOrRegion))
         }
+    }
+
+    # Most obvious signs: 
+    # - Multiple countries = redflag
+    $hopCount = (($user.Logs.Location | Group-Object CountryOrRegion | Sort Count -Descending) | Measure-Object).Count
+    if($hopCount -gt $HopsLimit -and ($user.RiskLogs | Measure-Object).Count -gt 0) {
+        $user.Compromised = $true
+        $user.CompReason = " # Countries Hopper (Multiple)"
     }
 
     #Write-Debug ($riskLogs | Out-String)
@@ -650,6 +697,7 @@ param(
 
     $user | Add-Member -MemberType NoteProperty -Name BaseIP -Value $baseIP
     $user | Add-Member -MemberType NoteProperty -Name BaseDevices -Value $baseDevices
+    $user | Add-Member -MemberType NoteProperty -Name BaseUA -Value $baseUA
     $user | Add-Member -MemberType NoteProperty -Name BaseCountry -Value ($baseCountry)
     $user | Add-Member -MemberType NoteProperty -Name BaseState -Value $baseState
     $user | Add-Member -MemberType NoteProperty -Name RiskLogs -Value $riskLogs
@@ -749,9 +797,10 @@ param(
             $current = $oldestRiskbyIP[$i].CreatedDateTime
             $next = $oldestRiskbyIP[$i+1].CreatedDateTime
             if($i -eq $oldestRiskbyIP.Count-1) {
-                $next = $lastset
+                $next = (Get-Date $oldestRiskbyIP[$i].CreatedDateTime).AddDays(-3).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                #$next = $lastset
                 # If ForceMode is ON, get failed logs from within the last 7 days from the last success sign-in to reduce false positive
-                if($f) { $next = (Get-Date $oldestRiskbyIP[$i].CreatedDateTime).AddDays(-7).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") }
+                #if($f) { $next = (Get-Date $oldestRiskbyIP[$i].CreatedDateTime).AddDays(-7).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") }
             }
 
             # Get failed sign-in logs in this time span, exclude logs from the same baseState or baseDevices
@@ -770,7 +819,7 @@ param(
             # Multiple failed attempts follow by a successful sigin
             if((($prevFailed | Measure-Object).Count -gt $HopsLimit) -or
                  # If a user is not in active groups, higher risk
-                 ((($prevFailed | Measure-Object).Count -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
+                 ((($prevFailed | Measure-Object).Count -ge 1) -and !$activeGroups.Contains($user.LocalGroup) -and ($user.Logs | Measure-Object).Count -lt $forceRisk) ) {
                 $user.Compromised = $true
                 $user.CompReason = " # Password-spray/Brute-force"
                 Break
@@ -1125,7 +1174,16 @@ param(
                                                                             "</div>"
                                                                             }
                                                                             "</div>"
-                                                                          };},  
+                                                                          };},
+                                 #@{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
+                                 #                                           $_.BaseUA | % {
+                                 #                                           "<div class='row border-bottom w-100 ml-0'>"
+                                 #                                               $_
+                                 #                                           "</div>"
+                                 #                                           }
+                                 #                                           "</div>"
+                                 #                                         };},
+                                                                                                                    
                                  @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + $_.BaseState.Name + "</span>"};}, 
                                  @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + $_.BaseCountry.Name + "</span>"};} |
                                  ConvertTo-Html -Fragment -As List
@@ -1257,6 +1315,15 @@ param(
                                                                             }
                                                                             "</div>"
                                                                           };}, 
+                                 #@{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
+                                 #                                           $_.BaseUA | % {
+                                 #                                           "<div class='row border-bottom w-100 ml-0'>"
+                                 #                                               $_
+                                 #                                           "</div>"
+                                 #                                           }
+                                 #                                           "</div>"
+                                 #                                         };},
+
                                  @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + $_.BaseState.Name + "</span>"};}, 
                                  @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + $_.BaseCountry.Name + "</span>"};} |
                                  ConvertTo-Html -Fragment -As List
@@ -1364,7 +1431,7 @@ function Main {
             exportReport $users
             sendReport
 
-            if(!$killEXO) {
+            if(!$killEXO -and !$keep) {
                 $dEXO = Read-Host "Disconnect EXO? (y/N): "
             }
             
@@ -1381,11 +1448,13 @@ function Main {
         #}
     } else {
         Write-Host "Usage: ./nyanalyzer.ps1 <input file OR a single email> [number of log samples] [-f] [-debug]
-        # The script accepts up to 4 parameters
+        # The script accepts up to 6 parameters
         # The first one is required: could be a list of emails in file, or a single email or an inline list of users `"user1, user2`"
         # The second one is optional: define the number of log sample you want to analyze
         # -f: force the script to get logs from the last 90 days
         # -debug: debug mode
+        # -killEXO switch: kill EXO connection without asking, reserved
+        # -keep switch: keep EXO connection without asking, reserved
         " -ForegroundColor Yellow
     }
 
@@ -1393,6 +1462,7 @@ function Main {
     if($isDebug) {
         Write-Debug ($users.baseCountry | Out-String)
         Write-Debug ($users.baseIP | Out-String)
+        Write-Debug ($users.baseUA | Out-String)
         #Write-Debug ($user.Logs | Out-String)      
         #Write-Debug ($IPTable | Out-String)
 
