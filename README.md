@@ -1,7 +1,7 @@
 # Nyanalyzer
 A PowerShell analyzer for AzureAD sign-in logs
 
-Usage: ./nyanalyzer.ps1 <input file OR a single email> [number of log samples] [-f] [-debug]
+Usage: ./nyanalyzer.ps1 "input file OR a single email" [number of log samples] [-f] [-debug]
 
 The script accepts up to 4 parameters
 
