@@ -685,10 +685,11 @@ param(
     # Most obvious signs: 
     # - Multiple countries = redflag
     $hopCount = (($user.Logs.Location | Group-Object CountryOrRegion | Sort Count -Descending) | Measure-Object).Count
-    if($hopCount -gt $HopsLimit -and ($user.RiskLogs | Measure-Object).Count -gt 0) {
+    if($hopCount -gt $HopsLimit -and ($riskLogs | Measure-Object).Count -gt 0) {
         $user.Compromised = $true
         $user.CompReason = " # Countries Hopper (Multiple)"
     }
+
 
     #Write-Debug ($riskLogs | Out-String)
     Write-Debug ("Total logs: " + $user.Logs.Count)
@@ -793,12 +794,16 @@ param(
 
         # Password-spray/bruteforce/proxy detection
         $proxyCount = 0;
-        for($i=0; $i -le $oldestRiskbyIP.Count-1; $i++) {
+        for($i=0; $i -le ($oldestRiskbyIP | Measure-Object).Count-1; $i++) {
             $current = $oldestRiskbyIP[$i].CreatedDateTime
             $next = $oldestRiskbyIP[$i+1].CreatedDateTime
-            if($i -eq $oldestRiskbyIP.Count-1) {
+            if($i -eq ($oldestRiskbyIP | Measure-Object).Count-1) {
                 $next = (Get-Date $oldestRiskbyIP[$i].CreatedDateTime).AddDays(-3).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
-                #$next = $lastset
+                #Write-Host $lastset $next
+                if($lastset -gt $next) {
+                    #$next = $lastset
+                    $next = $current
+                }
                 # If ForceMode is ON, get failed logs from within the last 7 days from the last success sign-in to reduce false positive
                 #if($f) { $next = (Get-Date $oldestRiskbyIP[$i].CreatedDateTime).AddDays(-7).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ") }
             }
@@ -819,7 +824,10 @@ param(
             # Multiple failed attempts follow by a successful sigin
             if((($prevFailed | Measure-Object).Count -gt $HopsLimit) -or
                  # If a user is not in active groups, higher risk
-                 ((($prevFailed | Measure-Object).Count -ge 1) -and !$activeGroups.Contains($user.LocalGroup) -and ($user.Logs | Measure-Object).Count -lt $forceRisk) ) {
+                 ( (($prevFailed | Measure-Object).Count -ge 1) -and 
+                    !$activeGroups.Contains($user.LocalGroup) -and 
+                    ($user.Logs | Measure-Object).Count -lt $forceRisk)
+                 ) {
                 $user.Compromised = $true
                 $user.CompReason = " # Password-spray/Brute-force"
                 Break
