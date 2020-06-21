@@ -464,6 +464,71 @@ param(
 }
 
 
+# Credit to flimbot for this function
+# https://github.com/Azure/azure-docs-powershell-azuread/issues/337#issuecomment-586021444
+Function Get-AzureADAuditSignInLogs2 {
+    Param(
+        [parameter(Mandatory=$false)]
+        [System.Boolean]
+        $All,
+        [parameter(Mandatory=$false)]
+        [parameter(ParameterSetName='GetQuery')]
+        [System.Int32]
+        $Top,
+        [parameter(Mandatory=$false)]
+        [parameter(ParameterSetName='GetQuery')]
+        [System.String]
+        $Filter
+    )
+    #Find token from previous 'Connect-AzureAD' command
+    #https://stackoverflow.com/questions/49569712/exposing-the-connection-token-from-connect-azuread
+    $accessToken = $null
+    try{
+        #$accessToken = [Microsoft.Open.Azure.AD.CommonLibrary.AzureSession]::AccessTokens['AccessToken'].AccessToken
+        $accessToken = ""
+    }
+    catch {
+        Throw 'Please run Connect-AzureAD to connect prior to running this command'
+    }
+
+    if($accessToken) {
+        $querystringparams = @{}
+
+        if($All) {
+            $querystringparams['all'] = 'True'
+        }
+
+        if($Top) {
+            $querystringparams['$top'] = $Top
+        }
+
+        if($Filter) {
+            $querystringparams['$filter'] = $Filter
+        }
+
+        $domain = 'graph.microsoft.com'
+        $url = "https://$domain/beta/auditLogs/signIns"
+    
+        if($querystringparams.Count -gt 0) {
+            Add-Type -AssemblyName System.Web
+            $url = $url + "?" + (($querystringparams.Keys | %{ [System.Web.HttpUtility]::UrlEncode($_) + "=" + [System.Web.HttpUtility]::UrlEncode($querystringparams[$_]) }) -join '&')
+        }
+
+        $headers = @{
+            'Authorization' = "Bearer $accessToken";
+            'Host' = $domain;
+            'Accept' = 'application/json';
+            'cmdlet-name' = 'Get-AzureADAuditSignInLogs'
+            'Accept-Encoding' = 'gzip, deflate'
+        }
+
+        (Invoke-RestMethod -Method Get -Uri $url -Headers $headers).value
+    }
+}
+
+
+
+
 
 # Dumping AzureAD success sign-in logs using preset filter
 function getAzureLogs {
@@ -492,7 +557,8 @@ param(
         $_.Location.State = $ipLoc.region
         $_.Location.CountryOrRegion = $ipLoc.country
     }
-    
+
+
     return $user
 }
 
@@ -508,188 +574,189 @@ param(
     [switch]$f
     )
     
+    if(($user.Logs | Measure-Object).Count -gt 0) {
+        $emptyDevices = $user.Logs | Where { ($_.DeviceDetail.DisplayName -eq $null) -and 
+                                             ($_.DeviceDetail.OperatingSystem -eq $null) -and 
+                                             ($_.DeviceDetail.Browser -eq $null) 
+                                            }
 
-    $emptyDevices = $user.Logs | Where { $_ | Select -Exp DeviceDetail | Where { ($_.DisplayName -eq $null) -and 
-                                                                 ($_.OperatingSystem -eq $null) -and 
-                                                                 ($_.Browser -eq $null) } 
-                                        }
-
-    # If a "bad protocol"/emptydevice is used most of the time and had enough samples, it's likely legit for legacy client
-    if(($user.Logs.Count -gt $forceRisk) -and 
-        ($emptyDevices.Count/$user.Logs.Count -ge 0.8) -and
-        ($hopCount -lt $HopsLimit) -and
-        !$user.Compromised) {
-            $emptyDevices | % { 
-                $_.DeviceDetail.Browser = $_.ClientAppUsed
-                $_.DeviceDetail.OperatingSystem = $_.ClientAppUsed
-                #$_.DeviceDetail.OperatingSystem = $_.AppDisplayName
-            }
-    }
-
-
-    $baseDevices = @()
-    $baseUA = @()
-    # Get trusted/registered devices
-    $trustedDevices = ($user.Logs | Where { ($_.DeviceDetail.TrustType -ne $null) } | Select -Exp DeviceDetail -Unique)
-    $trustedUA = ($user.Logs | Where { ($_.DeviceDetail.TrustType -ne $null) } | Select userAgent -Unique)
-
-    if($trustedDevices) {
-
-        $baseCountry = $user.Logs | Where {($badCountries -notcontains $_.Location.CountryOrRegion) -and
-                                                     ($trustedDevices.Name -contains $_.DeviceDetail) 
-                                                     } | Select -Exp Location | Group-Object CountryOrRegion | Sort Count -Descending | Select Name, Count
-        
-        $baseState = $user.Logs | Where { ($badCountries -notcontains $_.Location.CountryOrRegion) -and
-                                                     ($trustedDevices.Name -contains $_.DeviceDetail) 
-                                                     } | Select -Exp Location | Group-Object State | Sort Count -Descending | Select Name, Count
-
-        $baseIP =  $user.Logs | Where { ($trustedDevices.Name -contains $_.DeviceDetail)
-                                      } | Group-Object IpAddress | Sort Count -Descending | Select Name, Count
-
-        $baseIP | % { 
-            $tmp = $_.Name
-            $baseDevices += ($user.Logs | Where { 
-                                            #$inlog = $_
-                                            #($BadProtocols -notcontains $_.ClientAppUsed) -and 
-                                            ($_.IpAddress -eq $tmp) -and 
-                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
-                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
-                                              ($_.DeviceDetail.Browser -ne $null) )
-                                            } | Select -Exp DeviceDetail -Unique)
-
-            $baseUA += ($user.Logs | Where { 
-                                            #$inlog = $_
-                                            #($BadProtocols -notcontains $_.ClientAppUsed) -and 
-                                            ($_.IpAddress -eq $tmp) -and 
-                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
-                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
-                                              ($_.DeviceDetail.Browser -ne $null) )
-                                            } | Select userAgent -Unique)
-                    }
-
-
-                                
-        $baseDevices += $trustedDevices
-        $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select -Unique)
-
-        $baseUA += $trustedUA
-        $baseUA = @($baseUA | Where { $_ -ne $null } | Select -Unique)
-        
-    } 
-
-    if(!$trustedDevices -or $whiteCountries -notcontains $baseCountry.Name){
-        # Get baseline for everything
-        $baseCountry = $user.Logs.Location | Where { $badCountries -notcontains $_.CountryOrRegion } | Group-Object CountryOrRegion | Sort Count -Descending | Select -First 1 Name, Count
-        $baseState = $user.Logs.Location | Where { $badCountries -notcontains $_.CountryOrRegion } | Group-Object State | Sort Count -Descending  | Select -First 1 Name
-        $baseIP =  $user.Logs | Where { # ($BadProtocols -notcontains $_.ClientAppUsed) -and 
-                                         ($_.Location.State -eq $baseState.Name) -and 
-                                         ( ($_.DeviceDetail.DisplayName -ne $null) -or 
-                                           ($_.DeviceDetail.OperatingSystem -ne $null) -or 
-                                           ($_.DeviceDetail.Browser -ne $null) ) -and
-                                         ($badCountries -notcontains $_.CountryOrRegion)
-                                      } | Group-Object IpAddress | Sort Count -Descending | Select -First $safeIP Name, Count
-   
-        # Get all connected devices from baseIP(s)
-        #if(!$baseDevices) { $baseDevices = @() }
-
-        #$baseIP | % { $baseDevices += ($user.Logs | Where IpAddress -eq $_.Name | Group-Object DeviceDetail | Sort Count -Descending | Select Name) }
-        $baseIP | % { 
-            $tmp = $_.Name
-            $baseDevices += ($user.Logs | Where { 
-                                            #$inlog = $_
-                                            #($BadProtocols -notcontains $_.ClientAppUsed) -and 
-                                            ($_.IpAddress -eq $tmp) -and 
-                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
-                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
-                                              ($_.DeviceDetail.Browser -ne $null) )
-                                            } | Select -Exp DeviceDetail -Unique)
-
-            $baseUA += ($user.Logs | Where { 
-                                            #$inlog = $_
-                                            #($BadProtocols -notcontains $_.ClientAppUsed) -and 
-                                            ($_.IpAddress -eq $tmp) -and 
-                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
-                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
-                                              ($_.DeviceDetail.Browser -ne $null) )
-                                            } | Select userAgent -Unique)
-                    }
-
-
-        # Get top #n devices from logs regardless IPs, n = reference number of devices from the baseIPs
-        # Exclude bad/legacy protocols as they usually have no DeviceDetail
-        $ref = ($baseDevices | Measure-Object).Count
-        #Write-Host ($user.Logs | Where { ($BadProtocols -notcontains $_.ClientAppUsed) } | Group-Object DeviceDetail | Sort Count -Descending | Select -First $ref Name) -ForegroundColor Red
-        if($extend) {
-            $baseDevices += ($user.Logs | Where { #($BadProtocols -notcontains $_.ClientAppUsed) -and 
-                                                  ($_.Location.State -eq $baseState.Name)  -and 
-                                                  ( ($_.DeviceDetail.DisplayName -ne $null) -or 
-                                                    ($_.DeviceDetail.OperatingSystem -ne $null) -or 
-                                                    ($_.DeviceDetail.Browser -ne $null) )
-                                            } | Select -Exp DeviceDetail -First $ref -Unique)
-
-            $baseUA += ($user.Logs | Where { #($BadProtocols -notcontains $_.ClientAppUsed) -and 
-                                                  ($_.Location.State -eq $baseState.Name)  -and 
-                                                  ( ($_.DeviceDetail.DisplayName -ne $null) -or 
-                                                    ($_.DeviceDetail.OperatingSystem -ne $null) -or 
-                                                    ($_.DeviceDetail.Browser -ne $null) )
-                                            } | Select userAgent -First $ref -Unique)
-
-        } 
-
-        $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select -Unique)
-        $baseUA = @($baseUA | Where { $_ -ne $null } | Select -Unique)
-        
-        # Get trusted/registered devices
-        #$baseDevices += ($user.Logs | Where { ($baseDevices -notcontains $_.DeviceDetail) -and 
-        #                                      ($_ | Select -Exp DeviceDetail | Where TrustType -ne $null) } | 
-        #                                        Group-Object DeviceDetail | Sort Count -Descending | Select Name)
-    }
-
-    Write-Debug "########"
-    #Write-Debug ($baseDevices | Out-String)
-
-    #$baseDevices = ($baseDevices | Group-Object Name | Sort Count -Descending | Select Name)
-    Write-Debug ("Total baseDevices: " + ($baseDevices | Measure-Object).Count)
-    Write-Debug ($baseDevices.Name | Out-String)
-
-
-    # Fullfill empty device
-    $emptyDevices | % { 
+        # If a "bad protocol"/emptydevice is used most of the time and had enough samples, it's likely legit for legacy client
+        if((($user.Logs | Measure-Object).Count -gt $forceRisk) -and 
+            ($emptyDevices.Count/$user.Logs.Count -ge 0.8) -and
+            ($hopCount -lt $HopsLimit) -and
+            !$user.Compromised) {
+                $emptyDevices | % { 
                     $_.DeviceDetail.Browser = $_.ClientAppUsed
                     $_.DeviceDetail.OperatingSystem = $_.ClientAppUsed
                     #$_.DeviceDetail.OperatingSystem = $_.AppDisplayName
                 }
-    #########################################################################################################
-    #Write-Host ($user.Logs | Where { $_ | Select -Exp DeviceDetail | Where Browser -eq "IE 11.0" } )
-    #########################################################################################################
-
-    # Identify risk logs
-    if(($user.Logs | Measure-Object).Count -le $forceRisk) {
-        $riskLogs = $user.Logs | Where { 
-            (($_.MfaDetail -eq $null) -or $inMFA) -and 
-            ($whiteState -notcontains $_.Location.State)
         }
-    } else {
-        $riskLogs = $user.Logs | Where { 
-            #(($baseDevices -notcontains $_.DeviceDetail) -and ($_.MfaDetail -eq $null)) -or (($baseState.Name -ne ($_.Location.State) -and ($baseDevices -notcontains $_.DeviceDetail) -and ($_.MfaDetail -eq $null)) )
-            #($baseDevices -notcontains $_.DeviceDetail) -and
-            (($baseDevices -notcontains $_.DeviceDetail) -and ($baseIP.Name -notcontains $_.IpAddress) ) -and
-            (($_.MfaDetail -eq $null) -or $inMFA) -and 
-            ($_.IpAddress -notmatch $whiteIP) -and 
-            (($baseState.Name -notcontains $_.Location.State) -or
-            ($whiteState -notcontains $_.Location.State) -or
-            ($badCountries -contains $_.Location.CountryOrRegion))
+
+
+        $baseDevices = @()
+        $baseUA = @()
+
+        # Get trusted/registered devices
+        $trustedDevices += ($user.Logs | Where { ($_.DeviceDetail.TrustType -ne $null) } | Select -Exp DeviceDetail)
+        $trustedUA += ($user.Logs | Where { ($_.DeviceDetail.TrustType -ne $null) } | Select userAgent)
+
+        if($trustedDevices) {
+
+            $baseCountry = @($user.Logs | Where {($badCountries -notcontains $_.Location.CountryOrRegion) -and
+                                                         ($trustedDevices -contains $_.DeviceDetail) 
+                                                         } | Select -Exp Location | Group-Object CountryOrRegion | Sort Count -Descending | Select Name, Count)
+       
+            $baseState = @($user.Logs | Where { ($badCountries -notcontains $_.Location.CountryOrRegion) -and
+                                                         ($trustedDevices -contains $_.DeviceDetail) 
+                                                         } | Select -Exp Location | Group-Object State | Sort Count -Descending | Select Name, Count)
+
+            $baseIP =  $user.Logs | Where { ($trustedDevices -contains $_.DeviceDetail)
+                                          } | Group-Object IpAddress | Sort Count -Descending | Select Name, Count
+
+            $baseIP | % { 
+                $tmp = $_.Name
+                $baseDevices += ($user.Logs | Where { 
+                                                #$inlog = $_
+                                                #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                                ($_.IpAddress -eq $tmp) -and 
+                                                ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                  ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                  ($_.DeviceDetail.Browser -ne $null) )
+                                                } | Select -Exp DeviceDetail)
+
+                $baseUA += ($user.Logs | Where { 
+                                                #$inlog = $_
+                                                #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                                ($_.IpAddress -eq $tmp) -and 
+                                                ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                  ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                  ($_.DeviceDetail.Browser -ne $null) )
+                                                } | Select userAgent)
+                        }
+
+
+                                
+            $baseDevices += $trustedDevices
+            $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select * -Unique)
+
+            $baseUA += $trustedUA
+            $baseUA = @($baseUA | Where { $_ -ne $null } | Select * -Unique)
+        
+        } 
+
+        if(!$trustedDevices -or (($whiteCountries -notcontains $baseCountry.Name) -and ($user.Logs.Count -gt $forceRisk))){
+            # Get baseline for everything
+            $baseCountry += @($user.Logs.Location | Where { $badCountries -notcontains $_.CountryOrRegion } | Group-Object CountryOrRegion | Sort Count -Descending | Select -First 1 Name, Count)
+            $baseState += @($user.Logs.Location | Where { $badCountries -notcontains $_.CountryOrRegion } | Group-Object State | Sort Count -Descending  | Select -First 1 Name)
+            $baseIP =  $user.Logs | Where { # ($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                             ($_.Location.State -eq $baseState.Name) -and 
+                                             ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                               ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                               ($_.DeviceDetail.Browser -ne $null) ) -and
+                                             ($badCountries -notcontains $_.CountryOrRegion)
+                                          } | Group-Object IpAddress | Sort Count -Descending | Select -First $safeIP Name, Count
+   
+            # Get all connected devices from baseIP(s)
+            #if(!$baseDevices) { $baseDevices = @() }
+
+            #$baseIP | % { $baseDevices += ($user.Logs | Where IpAddress -eq $_.Name | Group-Object DeviceDetail | Sort Count -Descending | Select Name) }
+            $baseIP | % { 
+                $tmp = $_.Name
+                $baseDevices += ($user.Logs | Where { 
+                                                #$inlog = $_
+                                                #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                                ($_.IpAddress -eq $tmp) -and 
+                                                ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                  ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                  ($_.DeviceDetail.Browser -ne $null) )
+                                                } | Select -Exp DeviceDetail)
+
+                $baseUA += ($user.Logs | Where { 
+                                                #$inlog = $_
+                                                #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                                ($_.IpAddress -eq $tmp) -and 
+                                                ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                  ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                  ($_.DeviceDetail.Browser -ne $null) )
+                                                } | Select userAgent)
+                        }
+
+
+            # Get top #n devices from logs regardless IPs, n = reference number of devices from the baseIPs
+            # Exclude bad/legacy protocols as they usually have no DeviceDetail
+            $ref = ($baseDevices | Measure-Object).Count
+            #Write-Host ($user.Logs | Where { ($BadProtocols -notcontains $_.ClientAppUsed) } | Group-Object DeviceDetail | Sort Count -Descending | Select -First $ref Name) -ForegroundColor Red
+            if($extend) {
+                $baseDevices += ($user.Logs | Where { #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                                      ($_.Location.State -eq $baseState.Name)  -and 
+                                                      ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                        ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                        ($_.DeviceDetail.Browser -ne $null) )
+                                                } | Select -Exp DeviceDetail -First $ref)
+
+                $baseUA += ($user.Logs | Where { #($BadProtocols -notcontains $_.ClientAppUsed) -and 
+                                                      ($_.Location.State -eq $baseState.Name)  -and 
+                                                      ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                        ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                        ($_.DeviceDetail.Browser -ne $null) )
+                                                } | Select userAgent -First $ref)
+
+            } 
+
+            $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select * -Unique)
+            $baseUA = @($baseUA | Where { $_ -ne $null } | Select * -Unique)
+        
+            # Get trusted/registered devices
+            #$baseDevices += ($user.Logs | Where { ($baseDevices -notcontains $_.DeviceDetail) -and 
+            #                                      ($_ | Select -Exp DeviceDetail | Where TrustType -ne $null) } | 
+            #                                        Group-Object DeviceDetail | Sort Count -Descending | Select Name)
+        }
+
+        Write-Debug "########"
+        #Write-Debug ($baseDevices | Out-String)
+
+        #$baseDevices = ($baseDevices | Group-Object Name | Sort Count -Descending | Select Name)
+        Write-Debug ("Total baseDevices: " + ($baseDevices | Measure-Object).Count)
+        Write-Debug ($baseDevices.Name | Out-String)
+
+
+        # Fullfill empty device
+        $emptyDevices | % { 
+                        $_.DeviceDetail.Browser = $_.ClientAppUsed
+                        $_.DeviceDetail.OperatingSystem = $_.ClientAppUsed
+                        #$_.DeviceDetail.OperatingSystem = $_.AppDisplayName
+                    }
+        #########################################################################################################
+        #Write-Host ($user.Logs | Where { $_ | Select -Exp DeviceDetail | Where Browser -eq "IE 11.0" } )
+        #########################################################################################################
+
+        # Identify risk logs
+        if(($user.Logs | Measure-Object).Count -le $forceRisk) {
+            $riskLogs = $user.Logs | Where { 
+                (($_.MfaDetail -eq $null) -or $inMFA) -and 
+                ($whiteState -notcontains $_.Location.State)
+            }
+        } else {
+            $riskLogs = $user.Logs | Where { 
+                #(($baseDevices -notcontains $_.DeviceDetail) -and ($_.MfaDetail -eq $null)) -or (($baseState.Name -ne ($_.Location.State) -and ($baseDevices -notcontains $_.DeviceDetail) -and ($_.MfaDetail -eq $null)) )
+                #($baseDevices -notcontains $_.DeviceDetail) -and
+                (($baseDevices -notcontains $_.DeviceDetail) -and ($baseIP.Name -notcontains $_.IpAddress) ) -and
+                (($_.MfaDetail -eq $null) -or $inMFA) -and 
+                ($_.IpAddress -notmatch $whiteIP) -and 
+                ( ( ($baseState.Name -notcontains $_.Location.State) -and
+                ($whiteState -notcontains $_.Location.State) ) -or
+                ($badCountries -contains $_.Location.CountryOrRegion))
+            }
+        }
+
+        # Most obvious signs: 
+        # - Multiple countries = redflag
+        $hopCount = (($user.Logs.Location | Group-Object CountryOrRegion | Sort Count -Descending) | Measure-Object).Count
+        if($hopCount -gt $HopsLimit -and ($riskLogs | Measure-Object).Count -gt 0) {
+            $user.Compromised = $true
+            $user.CompReason = " # Countries Hopper (Multiple)"
         }
     }
-
-    # Most obvious signs: 
-    # - Multiple countries = redflag
-    $hopCount = (($user.Logs.Location | Group-Object CountryOrRegion | Sort Count -Descending) | Measure-Object).Count
-    if($hopCount -gt $HopsLimit -and ($riskLogs | Measure-Object).Count -gt 0) {
-        $user.Compromised = $true
-        $user.CompReason = " # Countries Hopper (Multiple)"
-    }
-
 
     #Write-Debug ($riskLogs | Out-String)
     Write-Debug ("Total logs: " + $user.Logs.Count)
@@ -1183,17 +1250,17 @@ param(
                                                                             }
                                                                             "</div>"
                                                                           };},
-                                 #@{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
-                                 #                                           $_.BaseUA | % {
-                                 #                                           "<div class='row border-bottom w-100 ml-0'>"
-                                 #                                               $_
-                                 #                                           "</div>"
-                                 #                                           }
-                                 #                                           "</div>"
-                                 #                                         };},
+                                 @{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
+                                                                            $_.BaseUA | % {
+                                                                            "<div class='row border-bottom w-100 ml-0'>"
+                                                                                $_.userAgent
+                                                                            "</div>"
+                                                                            }
+                                                                            "</div>"
+                                                                          };},
                                                                                                                     
-                                 @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + $_.BaseState.Name + "</span>"};}, 
-                                 @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + $_.BaseCountry.Name + "</span>"};} |
+                                 @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + (($_.BaseState.Name | Out-String) -replace "`n", " # ") + "</span>"};}, 
+                                 @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + (($_.BaseCountry.Name | Out-String) -replace "`n", " # ") + "</span>"};} |
                                  ConvertTo-Html -Fragment -As List
             $html += "<div class='container-fluid float-right px-0'>"
             if(($_.RiskLogs | Measure-Object).Count -gt 0) {
@@ -1323,17 +1390,17 @@ param(
                                                                             }
                                                                             "</div>"
                                                                           };}, 
-                                 #@{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
-                                 #                                           $_.BaseUA | % {
-                                 #                                           "<div class='row border-bottom w-100 ml-0'>"
-                                 #                                               $_
-                                 #                                           "</div>"
-                                 #                                           }
-                                 #                                           "</div>"
-                                 #                                         };},
+                                 @{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
+                                                                            $_.BaseUA | % {
+                                                                            "<div class='row border-bottom w-100 ml-0'>"
+                                                                                $_.userAgent
+                                                                            "</div>"
+                                                                            }
+                                                                            "</div>"
+                                                                          };},
 
-                                 @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + $_.BaseState.Name + "</span>"};}, 
-                                 @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + $_.BaseCountry.Name + "</span>"};} |
+                                 @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + (($_.BaseState.Name | Out-String) -replace "`n", " # ") + "</span>"};}, 
+                                 @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + (($_.BaseCountry.Name | Out-String) -replace "`n", " # ") + "</span>"};} |
                                  ConvertTo-Html -Fragment -As List
 
             $html += "</div>"
