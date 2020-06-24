@@ -81,7 +81,7 @@ $domain = "@ferris.edu"
 $LocalADOn = $true
 
 # Enable (Mailbox) AuditLogs analyze and define Operations to search (* for all)
-$AuditLogOn = $true
+$AuditLogOn = $false
 $AuditOperations = @("New-InboxRule", "Set-InboxRule")
 $RiskRules = @("DeleteMessage","SubjectOrBodyContainsWords",
                 "SubjectContainsWords","FromAddressContainsWords",
@@ -305,17 +305,15 @@ param(
     [string]$ip
     )
 
-    $ips = ""
-    $RiskCount = 0
-    $ip.Split(",") | % { if($table[$_] -eq $null) { $ips += "$($_)," } }
-    $ips = $ips.TrimEnd(",")
-
+    $ip = $ip.Trim()
+    Write-Debug $ip
     if($table[$ip] -eq $null) {
-        $api = curl "http://proxycheck.io/v2/?key=$($VPNTOKEN)&days=60&vpn=1&asn=1&node=1&time=1&inf=1&risk=2&port=1&seen=1&tag=msg&ip=$($ips)"
+        $url = "http://proxycheck.io/v2/$($ip)?key=$($VPNTOKEN)&days=60&vpn=1&asn=1&node=1&time=1&inf=1&risk=2&port=1&seen=1&tag=msg"
+        $api = curl $url
         $proxy = ConvertFrom-Json -InputObject $api
-        $ips.Split(",") | % {
-            $table[$_] = $proxy.$_
-        }
+        #Write-Host $url $proxy."$($ip)"
+        $table[$ip] = $proxy."$($ip)"
+        $proxy = $proxy."$($ip)"
         Write-Debug "IP API #1 called (proxycheck.io)"
     } else {
         $proxy = $table[$ip]
@@ -382,7 +380,7 @@ param(
 
         if(!$VPNTOKEN1) { $VPNTOKEN1 = "demo" }
 
-        if (($table[$ip] -eq $null) -or ($table[$ip].isProxy -eq $null) -and ($table[$ip].Proxy -eq "no")) { 
+        if (($table[$ip] -eq $null) -or (!$table[$ip].isProxy -and $table[$ip].Proxy -eq "no")) { 
             $api = curl "http://api.ip2proxy.com/?ip=$($ip)&key=$($VPNTOKEN1)&package=PX2"
             $proxy = ConvertFrom-Json -InputObject $api
             #$table[$ip] = @($proxy)
@@ -484,8 +482,8 @@ Function Get-AzureADAuditSignInLogs2 {
     #https://stackoverflow.com/questions/49569712/exposing-the-connection-token-from-connect-azuread
     $accessToken = $null
     try{
-        #$accessToken = [Microsoft.Open.Azure.AD.CommonLibrary.AzureSession]::AccessTokens['AccessToken'].AccessToken
-        $accessToken = ""
+        $accessToken = [Microsoft.Open.Azure.AD.CommonLibrary.AzureSession]::AccessTokens['AccessToken'].AccessToken
+        
     }
     catch {
         Throw 'Please run Connect-AzureAD to connect prior to running this command'
@@ -563,6 +561,7 @@ param(
 }
 
 
+
 # Analyze and extract risk logs
 function getRiskLogs {
 param(
@@ -580,6 +579,7 @@ param(
                                              ($_.DeviceDetail.Browser -eq $null) 
                                             }
 
+        $hopCount = (($user.Logs.Location | Group-Object CountryOrRegion | Sort Count -Descending) | Measure-Object).Count
         # If a "bad protocol"/emptydevice is used most of the time and had enough samples, it's likely legit for legacy client
         if((($user.Logs | Measure-Object).Count -gt $forceRisk) -and 
             ($emptyDevices.Count/$user.Logs.Count -ge 0.8) -and
@@ -637,17 +637,28 @@ param(
 
                                 
             $baseDevices += $trustedDevices
-            $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select * -Unique)
+            $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select -Unique)
 
             $baseUA += $trustedUA
-            $baseUA = @($baseUA | Where { $_ -ne $null } | Select * -Unique)
+            $baseUA = @($baseUA | Where { $_ -ne $null } | Select -Unique)
         
+            #Write-Host $trustedDevices -ForegroundColor Yellow
+            #Write-Host $baseDevices
+
         } 
 
-        if(!$trustedDevices -or (($whiteCountries -notcontains $baseCountry.Name) -and ($user.Logs.Count -gt $forceRisk))){
+        if( !$trustedDevices -or ($whiteCountries -notcontains $baseCountry.Name) ){
             # Get baseline for everything
-            $baseCountry += @($user.Logs.Location | Where { $badCountries -notcontains $_.CountryOrRegion } | Group-Object CountryOrRegion | Sort Count -Descending | Select -First 1 Name, Count)
-            $baseState += @($user.Logs.Location | Where { $badCountries -notcontains $_.CountryOrRegion } | Group-Object State | Sort Count -Descending  | Select -First 1 Name)
+            $baseCountry += @($user.Logs | Where { $badCountries -notcontains $_.Location.CountryOrRegion -and 
+                                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                              ($_.DeviceDetail.Browser -ne $null) ) } | 
+                                                    Group-Object { $_.Location.CountryOrRegion } | Sort Count -Descending | Select -First 1 Name, Count)
+            $baseState += @($user.Logs | Where { $badCountries -notcontains $_.Location.CountryOrRegion -and 
+                                                            ( ($_.DeviceDetail.DisplayName -ne $null) -or 
+                                                              ($_.DeviceDetail.OperatingSystem -ne $null) -or 
+                                                              ($_.DeviceDetail.Browser -ne $null) ) } | 
+                                                    Group-Object { $_.Location.State } | Sort Count -Descending | Select -First 1 Name, Count)
             $baseIP =  $user.Logs | Where { # ($BadProtocols -notcontains $_.ClientAppUsed) -and 
                                              ($_.Location.State -eq $baseState.Name) -and 
                                              ( ($_.DeviceDetail.DisplayName -ne $null) -or 
@@ -669,7 +680,7 @@ param(
                                                 ( ($_.DeviceDetail.DisplayName -ne $null) -or 
                                                   ($_.DeviceDetail.OperatingSystem -ne $null) -or 
                                                   ($_.DeviceDetail.Browser -ne $null) )
-                                                } | Select -Exp DeviceDetail)
+                                                } | Select -exp DeviceDetail)
 
                 $baseUA += ($user.Logs | Where { 
                                                 #$inlog = $_
@@ -703,8 +714,8 @@ param(
 
             } 
 
-            $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select * -Unique)
-            $baseUA = @($baseUA | Where { $_ -ne $null } | Select * -Unique)
+            $baseDevices = @($baseDevices | Where { $_ -ne $null } | Select -Unique)
+            $baseUA = @($baseUA | Where { $_ -ne $null } | Select -Unique)
         
             # Get trusted/registered devices
             #$baseDevices += ($user.Logs | Where { ($baseDevices -notcontains $_.DeviceDetail) -and 
@@ -717,7 +728,7 @@ param(
 
         #$baseDevices = ($baseDevices | Group-Object Name | Sort Count -Descending | Select Name)
         Write-Debug ("Total baseDevices: " + ($baseDevices | Measure-Object).Count)
-        Write-Debug ($baseDevices.Name | Out-String)
+        Write-Debug ($baseDevices | Out-String)
 
 
         # Fullfill empty device
@@ -743,15 +754,16 @@ param(
                 (($baseDevices -notcontains $_.DeviceDetail) -and ($baseIP.Name -notcontains $_.IpAddress) ) -and
                 (($_.MfaDetail -eq $null) -or $inMFA) -and 
                 ($_.IpAddress -notmatch $whiteIP) -and 
-                ( ( ($baseState.Name -notcontains $_.Location.State) -and
-                ($whiteState -notcontains $_.Location.State) ) -or
+
+                ( ( ($baseState.Name -notcontains $_.Location.State) -and 
+                        ($whiteState -notcontains $_.Location.State) ) -or
+                        #($whiteState -notcontains $_.Location.State) ) -or
                 ($badCountries -contains $_.Location.CountryOrRegion))
             }
         }
 
         # Most obvious signs: 
         # - Multiple countries = redflag
-        $hopCount = (($user.Logs.Location | Group-Object CountryOrRegion | Sort Count -Descending) | Measure-Object).Count
         if($hopCount -gt $HopsLimit -and ($riskLogs | Measure-Object).Count -gt 0) {
             $user.Compromised = $true
             $user.CompReason = " # Countries Hopper (Multiple)"
@@ -772,6 +784,8 @@ param(
 
     return $user
 }
+
+
 
 # For each risk logs, run an addtional analyzing
 function analyzeRisks {
@@ -794,7 +808,7 @@ param(
     Write-Debug "Proxy Risk: $($proxyRisk)"
     if(($proxyRisk -gt $HopsLimit) -or
          # If a user is not in active groups, higher risk
-         (($proxyRisk -ge 1) -and !$activeGroups.Contains($user.LocalGroup) ) ) {
+         (($proxyRisk -ge 1) -and (!$activeGroups.Contains($user.LocalGroup) -or ($user.Logs | Measure-Object).Count -lt $forceRisk ) ) ) {
         $user.Compromised = $true
         $user.CompReason = " # Proxied/Bad VPN Connections ($($proxyRisk)) #1"
     }
@@ -809,12 +823,22 @@ param(
 
 
         # Extract countries from risk logs, exclude baseCountry
-        $Hops = ($oldestRiskbyIP | ? {$_.Location.CountryOrRegion -ne $user.baseCountry.Name} | Group {$_.Location.CountryOrRegion})
-        #Write-Host ($Hops | Out-String) -ForegroundColor Red
+        $Hops = ($oldestRiskbyIP | ? {$_.Location.CountryOrRegion -notin $user.baseCountry.Name} | Group {$_.Location.CountryOrRegion})
+        Write-Debug ("Total Hops: " + ($Hops | Out-String))
         # - Non-active users with logs from more than 1 country and it's not from VPN
         $Hops | % {
+            $riskTime = $_.Group.CreatedDateTime
+            $prevSafe = $user.Logs | Where { ($_.CreatedDateTime -lt $riskTime) -and ($_.Location.CountryOrRegion -in $user.baseCountry.Name) } | Select -First 1 CreatedDateTime
+            if($prevSafe) {
+                $timeSpan = New-TimeSpan $prevSafe.CreatedDateTime $riskTime
+                }
+
+            #Write-Debug ($timeSpan | Out-String)
+
             $HopType = getProxyType $ProxyTable "$($_.Group.IpAddress)"
-            if($HopType.type -ne "VPN" -and
+            #Write-Host $_.Group.IpAddress $HopType
+            if(( ($HopType.type -ne "VPN" -and ($Hops | Measure-Object).Count -gt 1) -or
+                 ($HopType.type -ne "VPN" -and $timeSpan.TotalDays -lt 1) ) -and
                 # Uncomment the following line to enforce only on non-active users (less aggressive)
                 #!$activeGroups.Contains($user.LocalGroup) -and 
                 !$user.Compromised) { 
@@ -1142,8 +1166,6 @@ param(
         <title>Risk Logs Report</title>
         <meta name='viewport' content='width=device-width, initial-scale=1'>
         <link rel='stylesheet' href='https://maxcdn.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css'>
-        <link rel='stylesheet' href='https://cdn.datatables.net/1.10.21/css/jquery.dataTables.min.css'>
-        <script src='https://cdn.datatables.net/1.10.21/js/jquery.dataTables.min.js'></script>
         <script src='https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js'></script>
         <script src='https://maxcdn.bootstrapcdn.com/bootstrap/4.5.0/js/bootstrap.min.js'></script>
         </head>
@@ -1183,7 +1205,7 @@ param(
         <div class='container-fluid mb-5'>
           <div class='row border border-light py-1'>
             <div class='col-3'>Total number of user(s) analyzed</div>
-            <div class='col'><span class='badge badge-primary'>$(($user | Measure-Object).Count)</div>
+            <div class='col'><span class='badge badge-primary'>$(($user | Measure-Object).Count)</span></div>
             <div class='w-100'></div>
             <div class='col-3'>Compromised user(s)</div>
             <div class='col'><span class='badge badge-danger'>
@@ -1213,12 +1235,12 @@ param(
         "
         
 
-    ($users | Sort Compromised, { ($_.RiskLogs | Measure-Object).Count} -Descending ) | % {
+    ($users | Sort Compromised, { ($_.RiskLogs | Measure-Object).Count},{ ($_.Logs | Measure-Object).Count} -Descending ) | % {
 
         $html += "<div class='container-fluid mb-5'>"    
 
         if($_.Compromised) { $riskhead = "<div id='$(($_.Email).Split("@")[0] )_head' class='button btn-danger text-white py-1 px-1 font-weight-bold border border-secondary'> $($_.Email) # COMPROMISED $($_.CompReason)</div>" }
-        elseif ($_.RiskLogs -ne $null) { $riskhead = "<div id='$(($_.Email).Split("@")[0] )_head' class='button btn-warning text-danger py-1 px-1 font-weight-bold border border-secondary'>$($_.Email)</div>"}
+        elseif ($_.RiskLogs -ne $null) { $riskhead = "<div id='$(($_.Email).Split("@")[0] )_head' class='button btn-warning text-danger py-1 px-1 font-weight-bold border border-secondary'>$($_.Email) $($_.CompReason)</div>"}
         
         if(($_.RiskLogs | Measure-Object).Count -gt 0 -or $_.Compromised) {
             $html += "<link rel='stylesheet' href='https://cdn.datatables.net/1.10.21/css/jquery.dataTables.min.css'>
@@ -1506,7 +1528,7 @@ function Main {
             exportReport $users
             sendReport
 
-            if(!$killEXO -and !$keep) {
+            if(!$killEXO -and !$keep -and $AuditLogOn) {
                 $dEXO = Read-Host "Disconnect EXO? (y/N): "
             }
             
@@ -1537,7 +1559,7 @@ function Main {
     if($isDebug) {
         Write-Debug ($users.baseCountry | Out-String)
         Write-Debug ($users.baseIP | Out-String)
-        Write-Debug ($users.baseUA | Out-String)
+        #Write-Debug ($users.baseUA | Out-String)
         #Write-Debug ($user.Logs | Out-String)      
         #Write-Debug ($IPTable | Out-String)
 
