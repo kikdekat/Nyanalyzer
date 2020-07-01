@@ -81,7 +81,7 @@ $domain = "@ferris.edu"
 $LocalADOn = $true
 
 # Enable (Mailbox) AuditLogs analyze and define Operations to search (* for all)
-$AuditLogOn = $false
+$AuditLogOn = $true
 $AuditOperations = @("New-InboxRule", "Set-InboxRule")
 $RiskRules = @("DeleteMessage","SubjectOrBodyContainsWords",
                 "SubjectContainsWords","FromAddressContainsWords",
@@ -116,19 +116,26 @@ $VPNTOKEN = @("")
 $nToken = 0
 
 # File name settings
-$ReportFile = "Nyan-Analyzing-Results_" + (Get-Date).tostring("MM-dd-yyyy") + ".html"
-$MonitorFile = "Nyan-Monitoring-Users.csv"
-$CompFile = "Nyan-Compromised-Users.csv"
-$credsFile = ".\creds.xml"
+$reportFolder = ((Get-Location).Path) + "\NyanReports\"
+$tmp = Test-Path $reportFolder
+if(!($tmp))
+{
+      New-Item -ItemType Directory -Force -Path $reportFolder
+}
+
+$ReportFile = $reportFolder + "\Nyan-Analyzing-Results_" + (Get-Date).tostring("MM-dd-yyyy") + ".html"
+$MonitorFile = $reportFolder + "\Nyan-Monitoring-Users.csv"
+$CompFile = $reportFolder + "\Nyan-Compromised-Users.csv"
+$credsFile = ".\NyanData\creds.xml"
 
 # IP Proxy table
-$ProxyTableFile = ".\ProxyTable.xml"
+$ProxyTableFile = ".\NyanData\ProxyTable.xml"
 if (Test-Path $ProxyTableFile -PathType Leaf) {
     $ProxyTable = Import-Clixml $ProxyTableFile
 } else { $ProxyTable = @{} }
 
 # IP to country table
-$IPTableFile = ".\IPLocation.xml"
+$IPTableFile = ".\NyanData\IPLocation.xml"
 if (Test-Path $IPTableFile -PathType Leaf) {
     $IPTable = Import-Clixml $IPTableFile
 } else { $IPTable = @{} }
@@ -185,7 +192,7 @@ if($mailcc) { $mailconf.Add("Cc",$mailcc) }
 function goAzureAD {
 param(
     [Parameter()]
-    [string]$credsFile = ".\creds.xml"
+    [string]$credsFile = ".\NyanData\creds.xml"
     )
 
     ###############################################################
@@ -549,7 +556,7 @@ param(
     $filter = "userPrincipalName eq '$email' and status/errorCode eq 0 and createdDateTime ge $lastset"
     $logs = Get-AzureADAuditSignInLogs -Filter $filter -Top $samples -All:$true
     $user | Add-Member -MemberType NoteProperty -Name Logs -Value $logs
-    $user.Logs | Where { $_ | Select -Exp Location | Where CountryOrRegion -eq $null } | % { 
+    $user.Logs | Where { $_ -ne $null -and $_.Location.CountryOrRegion -eq $null } | % { 
         $ipLoc = getIPLocation $IPTable $_.IpAddress
         $_.Location.City = $ipLoc.city
         $_.Location.State = $ipLoc.region
@@ -889,7 +896,12 @@ param(
             $current = $oldestRiskbyIP[$i].CreatedDateTime
             $next = $oldestRiskbyIP[$i+1].CreatedDateTime
             if($i -eq ($oldestRiskbyIP | Measure-Object).Count-1) {
-                $next = (Get-Date $oldestRiskbyIP[$i].CreatedDateTime).AddDays(-3).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                $prevSafe = $user.Logs | Where { ($_.CreatedDateTime -lt $oldestRiskbyIP[$i].CreatedDateTime) -and ($_.Location.CountryOrRegion -in $user.baseCountry.Name) } | Select -First 1 CreatedDateTime
+                if($prevSafe) {
+                    $next = $prevSafe.CreatedDateTime
+                } else { 
+                    $next = (Get-Date $oldestRiskbyIP[$i].CreatedDateTime).AddDays(-3).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ")
+                }
                 #Write-Host $lastset $next
                 if($lastset -gt $next) {
                     #$next = $lastset
@@ -1204,10 +1216,10 @@ param(
         </div>
         <div class='container-fluid mb-5'>
           <div class='row border border-light py-1'>
-            <div class='col-3'>Total number of user(s) analyzed</div>
+            <div class='col-2'>Total number of user(s) analyzed</div>
             <div class='col'><span class='badge badge-primary'>$(($user | Measure-Object).Count)</span></div>
             <div class='w-100'></div>
-            <div class='col-3'>Compromised user(s)</div>
+            <div class='col-2'>Compromised user(s)</div>
             <div class='col'><span class='badge badge-danger'>
                 $(($user | Where {$_.Compromised -eq $true } | Measure-Object).Count)</span> 
                 $( $user | Where {$_.Compromised -eq $true } | % { 
@@ -1219,7 +1231,7 @@ param(
                 $($str = '')
             </div>
             <div class='w-100'></div>
-            <div class='col-3'>Risky user(s)</div>
+            <div class='col-2'>Risky user(s)</div>
             <div class='col'><span class='badge badge-warning'>
                 $(($user | Where { $_.Compromised -ne $true -and ($_.RiskLogs | Measure-Object).Count -gt 0 } | Measure-Object).Count)</span>
                 $($user | Where { $_.Compromised -ne $true -and ($_.RiskLogs | Measure-Object).Count -gt 0 } | % { 
@@ -1246,18 +1258,18 @@ param(
             $html += "<link rel='stylesheet' href='https://cdn.datatables.net/1.10.21/css/jquery.dataTables.min.css'>
                       <script src='https://cdn.datatables.net/1.10.21/js/jquery.dataTables.min.js'></script>"
             $html += $riskhead
-            $html += $_ | Select @{Name='Email';Expression={$_.Email};}, 
-                                 @{Name='Group';Expression={$_.LocalGroup};},
-                                 @{Name='Last Set';Expression={($_.Lastset)};}, 
-                                 @{Name='VPN User';Expression={ if($_.VPN) { $vcolor = "#9c0000"}; "<div style='color: $($vcolor); font-weight: bold;'>$($_.VPN)</div>" };}, 
-                                 @{Name='Logs';Expression={$_.Logs.Count};}, 
-                                 @{Name='RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, 
-                                 @{Name='BaseIP';Expression={ $_.BaseIP.Name | % {
+            $html += $_ | Select @{Name='#Email';Expression={$_.Email};}, 
+                                 @{Name='#Group';Expression={$_.LocalGroup};},
+                                 @{Name='#Last Set';Expression={($_.Lastset)};}, 
+                                 @{Name='#VPN User';Expression={ if($_.VPN) { $vcolor = "#9c0000"}; "<div style='color: $($vcolor); font-weight: bold;'>$($_.VPN)</div>" };}, 
+                                 @{Name='#Logs';Expression={$_.Logs.Count};}, 
+                                 @{Name='#RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, 
+                                 @{Name='#BaseIP';Expression={ $_.BaseIP.Name | % {
                                                                                   "<div class='row border-bottom w-100 ml-0'><span class='font-weight-bold'>"
                                                                                   $_
                                                                                   "</span></div>" 
                                                                                  }};}, 
-                                 @{Name='BaseDevices';Expression={ "<div class='table-md my-x w-100'>"
+                                 @{Name='#BaseDevices';Expression={ "<div class='table-md my-x w-100'>"
                                                                             $_.BaseDevices | % {
                                                                             "<div class='row border-bottom w-100 ml-0'>"
                                                                                 $_.PSObject.Properties | %  {
@@ -1272,7 +1284,7 @@ param(
                                                                             }
                                                                             "</div>"
                                                                           };},
-                                 @{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
+                                 @{Name='#UserAgent';Expression={ "<div class='table-md my-x w-100'>"
                                                                             $_.BaseUA | % {
                                                                             "<div class='row border-bottom w-100 ml-0'>"
                                                                                 $_.userAgent
@@ -1281,9 +1293,10 @@ param(
                                                                             "</div>"
                                                                           };},
                                                                                                                     
-                                 @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + (($_.BaseState.Name | Out-String) -replace "`n", " # ") + "</span>"};}, 
-                                 @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + (($_.BaseCountry.Name | Out-String) -replace "`n", " # ") + "</span>"};} |
+                                 @{Name='#BaseState';Expression={ "<span class='font-weight-bold'>" + (($_.BaseState.Name | Out-String) -replace "`n", " # ") + "</span>"};}, 
+                                 @{Name='#BaseCountry';Expression={ "<span class='font-weight-bold'>" + (($_.BaseCountry.Name | Out-String) -replace "`n", " # ") + "</span>"};} |
                                  ConvertTo-Html -Fragment -As List
+            $html = $html -replace "<td>#","<td style='width:15%'>"
             $html += "<div class='container-fluid float-right px-0'>"
             if(($_.RiskLogs | Measure-Object).Count -gt 0) {
 
@@ -1384,20 +1397,20 @@ param(
             $html += "<a class='btn-secondary' data-toggle='collapse' href='#$(($_.Email).Split('@')[0] )' role='button' aria-expanded='false' aria-controls='$(($_.Email).Split('@')[0] )'>
             <div id='$(($_.Email).Split("@")[0] )_head' class='button btn-secondary text-success py-1 px-1 font-weight-bold border border-secondary'>$($_.Email)</div></a>
             <div id='$(($_.Email).Split('@')[0] )' class='collapse'>"
-            $html += $_ | Select @{Name='Email';Expression={$_.Email};}, 
-                                 @{Name='Group';Expression={$_.LocalGroup};},
-                                 @{Name='Last Set';Expression={($_.Lastset)};}, 
-                                 @{Name='VPN User';
+            $html += $_ | Select @{Name='#Email';Expression={$_.Email};}, 
+                                 @{Name='#Group';Expression={$_.LocalGroup};},
+                                 @{Name='#Last Set';Expression={($_.Lastset)};}, 
+                                 @{Name='#VPN User';
                                     Expression={ 
                                         if($_.VPN) { $vcolor = "#9c0000"}; "<div style='color: $($vcolor); font-weight: bold;'>$($_.VPN)</div>" };}, 
-                                 @{Name='Logs';Expression={$_.Logs.Count};},
-                                 @{Name='RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, 
-                                 @{Name='BaseIP';Expression={ $_.BaseIP.Name | % {
+                                 @{Name='#Logs';Expression={$_.Logs.Count};},
+                                 @{Name='#RiskLogs';Expression={($_.RiskLogs | Measure-Object).Count};}, 
+                                 @{Name='#BaseIP';Expression={ $_.BaseIP.Name | % {
                                                                                   "<div class='row border-bottom w-100 ml-0'><span class='font-weight-bold'>"
                                                                                   $_
                                                                                   "</span></div>" 
                                                                                  }};}, 
-                                 @{Name='BaseDevices';Expression={ "<div class='table-md my-x w-100'>"
+                                 @{Name='#BaseDevices';Expression={ "<div class='table-md my-x w-100'>"
                                                                             $_.BaseDevices | % {
                                                                             "<div class='row border-bottom w-100 ml-0'>"
                                                                                 $_.PSObject.Properties | %  {
@@ -1412,7 +1425,7 @@ param(
                                                                             }
                                                                             "</div>"
                                                                           };}, 
-                                 @{Name='UserAgent';Expression={ "<div class='table-md my-x w-100'>"
+                                 @{Name='#UserAgent';Expression={ "<div class='table-md my-x w-100'>"
                                                                             $_.BaseUA | % {
                                                                             "<div class='row border-bottom w-100 ml-0'>"
                                                                                 $_.userAgent
@@ -1421,10 +1434,10 @@ param(
                                                                             "</div>"
                                                                           };},
 
-                                 @{Name='BaseState';Expression={ "<span class='font-weight-bold'>" + (($_.BaseState.Name | Out-String) -replace "`n", " # ") + "</span>"};}, 
-                                 @{Name='BaseCountry';Expression={ "<span class='font-weight-bold'>" + (($_.BaseCountry.Name | Out-String) -replace "`n", " # ") + "</span>"};} |
+                                 @{Name='#BaseState';Expression={ "<span class='font-weight-bold'>" + (($_.BaseState.Name | Out-String) -replace "`n", " # ") + "</span>"};}, 
+                                 @{Name='#BaseCountry';Expression={ "<span class='font-weight-bold'>" + (($_.BaseCountry.Name | Out-String) -replace "`n", " # ") + "</span>"};} |
                                  ConvertTo-Html -Fragment -As List
-
+            $html = $html -replace "<td>#","<td style='width:15%'>"
             $html += "</div>"
         }
         $html += "</div>"
@@ -1510,7 +1523,7 @@ function Main {
                 foreach($item in $totalItems) {
                     $i++
                     $Activity = "Nyan is running.."
-                    Write-Progress -Activity $item -Status "Progress: $i / $($totalItems.Count)" -PercentComplete (($i / $totalItems.Count)  * 100)
+                    Write-Progress -Activity "$item" -Status "Progress: $i / $($totalItems.Count)" -PercentComplete (($i / $totalItems.Count)  * 100)
                     $users += (NyanLogs -username $item -samples $samples -f:$f)
                     #Write-Debug ($tmp | Out-String)
                 }
