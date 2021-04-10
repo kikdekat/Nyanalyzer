@@ -183,13 +183,13 @@ $credsFile = ".\NyanData\creds.xml"
 $sendMail = $false
 $silentMail = $true
 
-$mailfrom = "security@ferris.edu" 
-$mailto = @("security@ferris.edu")
+$mailfrom = "[CHANGE_ME]" 
+$mailto = @("[CHANGE_ME]")
 $mailcc = @("") 
 $mailSub = "Nyan Analyzing Results " + (Get-Date).tostring("MM-dd-yyyy")
 $mailBody = "Nyan Analyzing Results for " + (Get-Date).tostring("MM-dd-yyyy")
 $mailfiles = @($ReportFile,$MonitorFile,$CompFile)
-$mailserver = "ferris-edu.mail.protection.outlook.com"
+$mailserver = "[CHANGE_ME]"
 
 $mailconf = @{
     From = $mailfrom 
