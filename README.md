@@ -1,7 +1,13 @@
 # Nyanalyzer
-A PowerShell analyzer for AzureAD sign-in logs. Please change the "[CHANGE_ME]" value to yours.
+A PowerShell analyzer for AzureAD sign-in logs. It detects abnormal sign-ins and malicious inbox rules.  
+The result is quite similar to the built-in AzureAD risky sign-ins alerts as both have similar abnormal activities detection mechanisms I guess (trusted devices based on "statistical").  
 
-Usage:
+Please change the "[CHANGE_ME]" value in the script to yours.
+
+### Prerequisites:
+AzureAD Powershell module is required, but it should be installed automatically when the script runs.
+
+### Usage:
 ```
 ./nyanalyzer.ps1 <input file OR emails> [number of log samples] [-f] [-debug] [-killEXO] [-keep]
 ```
