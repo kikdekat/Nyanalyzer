@@ -2,6 +2,8 @@
 A PowerShell analyzer for AzureAD sign-in logs. It detects abnormal sign-ins and malicious inbox rules.  
 The result is quite similar to the built-in AzureAD risky sign-ins alerts as both have similar abnormal activities detection mechanisms I guess (trusted devices based on "statistical").  
 
+*I am no Powershell nor GitHub expert. Please help me improve it.*
+
 Please change the "[CHANGE_ME]" value in the script to yours.
 
 ### Prerequisites:
